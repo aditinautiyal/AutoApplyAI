@@ -1,0 +1,42 @@
+# UI
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0
+
+# Browser automation
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+
+# AI APIs
+anthropic>=0.18.0
+openai>=1.12.0
+
+# Google / Gmail
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.118.0
+
+# Database
+aiosqlite>=0.19.0
+cryptography>=42.0.0
+
+# Resume parsing
+pdfplumber>=0.10.3
+PyPDF2>=3.0.1
+
+# Web scraping / requests
+requests>=2.31.0
+httpx>=0.26.0
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+feedparser>=6.0.11
+
+# Async
+asyncio-throttle>=1.0.2
+aiohttp>=3.9.3
+
+# Utilities
+python-dotenv>=1.0.1
+pydantic>=2.6.1
+schedule>=1.2.1
+pyinstaller>=6.3.0
