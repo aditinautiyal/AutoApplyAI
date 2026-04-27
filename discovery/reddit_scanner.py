@@ -2,7 +2,6 @@
 discovery/reddit_scanner.py
 Scans Reddit for job postings, hiring threads, and referral opportunities.
 No auth needed — reads public posts via JSON API.
-Targets: r/forhire, r/cscareerquestions, r/MachineLearning, r/startups, etc.
 """
 
 import asyncio
@@ -14,7 +13,6 @@ import httpx
 from discovery.job_pool import Job, JobScorer, get_pool
 from core.settings_store import get_store
 
-# Subreddits to scan for job posts
 JOB_SUBREDDITS = [
     "forhire",
     "cscareerquestions",
@@ -23,18 +21,17 @@ JOB_SUBREDDITS = [
     "datascience",
     "learnmachinelearning",
     "startups",
-    "entrepreneur",
     "remotework",
     "WFH",
     "jobsearchhacks",
     "internships",
     "ITCareerQuestions",
     "Python",
-    "softwaregore",  # sometimes has hiring posts
     "programming",
+    "cscareerquestions",
+    "csMajors",
 ]
 
-# Hiring signal keywords
 HIRING_KEYWORDS = [
     "hiring", "looking for", "we're hiring", "job opening", "internship available",
     "apply here", "apply at", "application link", "join our team", "open position",
@@ -53,58 +50,41 @@ def _job_id(url: str) -> str:
 
 
 def _extract_apply_url(text: str) -> str:
-    """Extract application URL from post text."""
-    # Look for greenhouse, lever, workday URLs first
     ats_pattern = r'https?://[^\s<>"]+(?:greenhouse\.io|lever\.co|myworkdayjobs|ashbyhq|workable)[^\s<>"]*'
     match = re.search(ats_pattern, text, re.IGNORECASE)
     if match:
         return match.group(0)
-
-    # Generic URL in post
     url_pattern = r'https?://[^\s<>"\)]+(?:apply|jobs|careers|hiring)[^\s<>"\)]*'
     match = re.search(url_pattern, text, re.IGNORECASE)
     if match:
         return match.group(0)
-
     return ""
 
 
 def _is_hiring_post(title: str, text: str) -> bool:
-    """Check if a post is about hiring / job opportunity."""
     combined = (title + " " + text).lower()
     return any(kw in combined for kw in HIRING_KEYWORDS)
 
 
 def _extract_job_details(title: str, text: str, url: str) -> dict:
-    """Extract job title, company, location from post."""
-    # Common patterns: "[Hiring] Company - Role | Location"
     company = ""
     job_title = title
 
-    # [Hiring] pattern
     if "[hiring]" in title.lower():
         rest = re.sub(r'\[hiring\]', '', title, flags=re.IGNORECASE).strip()
         if " - " in rest:
             parts = rest.split(" - ", 1)
             company = parts[0].strip()
             job_title = parts[1].strip()
-        elif " | " in rest:
-            parts = rest.split(" | ", 1)
-            job_title = parts[0].strip()
 
-    # Location
     location = ""
-    loc_patterns = [
-        r'\b(Remote|Chicago|Dallas|New York|San Francisco|Austin|Seattle|Boston|US)\b',
-        r'\|([^|]+)\|',
-        r'\(([^)]+, [A-Z]{2})\)',
-    ]
     combined = title + " " + text[:500]
-    for pattern in loc_patterns:
-        m = re.search(pattern, combined, re.IGNORECASE)
-        if m:
-            location = m.group(1).strip()
-            break
+    loc_match = re.search(
+        r'\b(Remote|Chicago|Dallas|New York|San Francisco|Austin|Seattle|Boston|US)\b',
+        combined, re.IGNORECASE
+    )
+    if loc_match:
+        location = loc_match.group(1).strip()
 
     apply_url = _extract_apply_url(text)
 
@@ -120,7 +100,6 @@ def _extract_job_details(title: str, text: str, url: str) -> dict:
 
 async def _fetch_subreddit_new(subreddit: str, client: httpx.AsyncClient,
                                 limit: int = 25) -> list[dict]:
-    """Fetch new posts from a subreddit via Reddit JSON API."""
     try:
         resp = await client.get(
             f"https://www.reddit.com/r/{subreddit}/new.json",
@@ -144,7 +123,6 @@ async def _fetch_subreddit_new(subreddit: str, client: httpx.AsyncClient,
                 "url": f"https://reddit.com{post.get('permalink', '')}",
                 "external_url": post.get("url", ""),
                 "score": post.get("score", 0),
-                "created": post.get("created_utc", 0),
             })
         return posts
 
@@ -155,7 +133,6 @@ async def _fetch_subreddit_new(subreddit: str, client: httpx.AsyncClient,
 
 async def _fetch_subreddit_search(subreddit: str, query: str,
                                    client: httpx.AsyncClient) -> list[dict]:
-    """Search within a subreddit."""
     try:
         resp = await client.get(
             f"https://www.reddit.com/r/{subreddit}/search.json",
@@ -186,19 +163,14 @@ async def _fetch_subreddit_search(subreddit: str, query: str,
 
 
 async def run_reddit_discovery(continuous: bool = True, stop_event=None):
-    """
-    Continuously scan Reddit for job postings.
-    Runs as background coroutine alongside other discovery sources.
-    """
     store = get_store()
     pool = get_pool()
     scorer = JobScorer()
-    profile = store.get_profile() or {}
 
-    target_roles = profile.get("target_roles", "software engineer AI ML intern")
     search_terms = [
         "hiring intern", "software engineer intern", "AI ML hiring",
-        "machine learning intern", "data science intern", "remote intern"
+        "machine learning intern", "data science intern", "remote intern",
+        "cs intern 2025", "summer intern 2025", "internship opening"
     ]
 
     print("[Reddit] Discovery starting...")
@@ -211,7 +183,6 @@ async def run_reddit_discovery(continuous: bool = True, stop_event=None):
         added_total = 0
 
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # Scan key subreddits for new posts
             for subreddit in JOB_SUBREDDITS:
                 if stop_event and stop_event.is_set():
                     break
@@ -243,17 +214,17 @@ async def run_reddit_discovery(continuous: bool = True, stop_event=None):
                     )
                     job.score = scorer.score(job)
 
-                    if job.score >= 4.0:
+                    if scorer.passes_threshold(job.score):
                         was_added = pool.add(job)
                         if was_added:
                             added_total += 1
-                            print(f"[Reddit] Added: {job.title} @ {job.company or 'Unknown'} (r/{subreddit})")
+                            print(f"[Reddit] Added: {job.title} @ {job.company or 'Unknown'} (score: {job.score:.1f})")
 
                 await asyncio.sleep(random.uniform(2, 4))
 
-            # Also search specific terms in r/forhire and r/cscareerquestions
-            for term in search_terms[:3]:
-                for subreddit in ["forhire", "cscareerquestions"]:
+            # Search specific terms
+            for term in search_terms[:4]:
+                for subreddit in ["forhire", "cscareerquestions", "internships"]:
                     if stop_event and stop_event.is_set():
                         break
                     posts = await _fetch_subreddit_search(subreddit, term, client)
@@ -276,7 +247,7 @@ async def run_reddit_discovery(continuous: bool = True, stop_event=None):
                             location=details["location"],
                         )
                         job.score = scorer.score(job)
-                        if job.score >= 4.0:
+                        if scorer.passes_threshold(job.score):
                             if pool.add(job):
                                 added_total += 1
                     await asyncio.sleep(random.uniform(1.5, 3))
@@ -287,4 +258,4 @@ async def run_reddit_discovery(continuous: bool = True, stop_event=None):
         if not continuous:
             break
 
-        await asyncio.sleep(120)  # Re-scan every 2 minutes
+        await asyncio.sleep(120)

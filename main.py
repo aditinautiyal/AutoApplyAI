@@ -149,7 +149,6 @@ class DashboardTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_all)
 
-        # Review mode toggle — ON by default for safety
         from PyQt6.QtWidgets import QCheckBox
         self.review_toggle = QCheckBox("🔍 Review each application before submitting")
         self.review_toggle.setChecked(True)
@@ -215,12 +214,10 @@ class DashboardTab(QWidget):
         layout.addWidget(self.log)
         layout.addStretch()
 
-        # Connect signals
         signals.track_update.connect(self._on_track_update)
         signals.slow_update.connect(self._on_slow_update)
         signals.log_message.connect(self._append_log)
 
-        # Auto-refresh stats every 5 seconds
         self.timer = QTimer()
         self.timer.timeout.connect(self._refresh_stats)
         self.timer.start(5000)
@@ -261,19 +258,10 @@ class DashboardTab(QWidget):
     def _start_all(self):
         store = self.store
         num_tracks = store.get("track_count", 2)
-
-        # Start fast tracks
         self.fast.start(num_tracks)
-
-        # Start slow lanes
         self.slow.start()
-
-        # Start all discovery sources
         self.discovery.start()
-
-        # Start inbox monitor
         self.inbox.start()
-
         self._is_running = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -374,7 +362,6 @@ class TrackerTab(QWidget):
         header.addWidget(refresh_btn)
         layout.addLayout(header)
 
-        # Stats bar
         stats_bar = QLabel()
         stats_bar.setStyleSheet(f"color:{MUTED}; font-size:12px;")
         stats_bar.setObjectName("stats_bar")
@@ -396,7 +383,6 @@ class TrackerTab(QWidget):
         self._load()
         signals.app_submitted.connect(lambda _: self._load())
 
-        # Auto-refresh every 30s
         self.timer = QTimer()
         self.timer.timeout.connect(self._load)
         self.timer.start(30000)
@@ -405,7 +391,6 @@ class TrackerTab(QWidget):
         apps = self.store.get_applications(limit=500)
         self.table.setRowCount(len(apps))
 
-        # Update stats bar
         submitted = sum(1 for a in apps if a.get("status") == "submitted")
         responses = sum(1 for a in apps if a.get("response_type"))
         interviews = sum(1 for a in apps if a.get("response_type") == "interview")
@@ -570,7 +555,7 @@ class AIChatTab(QWidget):
 
         layout.addWidget(QLabel("🤖 AI Command Chat"))
         layout.addWidget(QLabel(
-            "Tell AutoApplyAI what to change. Examples: "
+            'Tell AutoApplyAI what to change. Examples: '
             '"add another track" / "focus on ML jobs only" / '
             '"pause slow lane" / "show me stats" / "target Chicago only"'
         ))
@@ -655,7 +640,6 @@ Command: {command}"""
                     store.set("track_count", count)
                 elif atype == "update_setting":
                     store.set(action["key"], action["value"])
-                    # Also update profile if it's a profile field
                     profile_fields = {
                         "target_roles", "locations", "job_types",
                         "salary_min", "salary_max", "dream_criteria"
@@ -689,7 +673,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 720)
         self.setStyleSheet(MAIN_STYLE)
 
-        # Initialise all managers
         self.fast_manager = TrackManager(
             status_callback=lambda t, s, m: signals.track_update.emit(t, s, m)
         )
@@ -703,10 +686,10 @@ class MainWindow(QMainWindow):
             on_new_response=lambda r: signals.notification.emit(r)
         )
 
-        # Import tabs
         from ui.extra_effort_tab import ExtraEffortTab
         from ui.research_library_tab import ResearchLibraryTab
         from ui.settings_tab import SettingsTab
+        from ui.tracker_tab import TrackerTab as FullTrackerTab
 
         tabs = QTabWidget()
         tabs.addTab(
@@ -714,19 +697,19 @@ class MainWindow(QMainWindow):
                          self.discovery, self.inbox),
             "⚡ Dashboard"
         )
-        tabs.addTab(TrackerTab(),                            "📋 Applications")
+        tabs.addTab(FullTrackerTab(),                        "📋 Applications")
         tabs.addTab(InboxTab(),                              "📬 Inbox")
         tabs.addTab(ExtraEffortTab(),                        "🎯 Extra Effort")
         tabs.addTab(ResearchLibraryTab(),                    "📚 Research Library")
         tabs.addTab(AIChatTab(self.fast_manager, self.slow_manager), "🤖 AI Chat")
         tabs.addTab(SettingsTab(),                           "⚙️ Settings")
-        # Approval dialog queue checker
-        from PyQt6.QtCore import QTimer as _ApprovalTimer
-        self._approval_timer = _ApprovalTimer()
-        self._approval_timer.timeout.connect(self._check_approval_queue)
-        self._approval_timer.start(300)
 
         self.setCentralWidget(tabs)
+
+        # ── Approval queue timer (polls every 300ms for background track requests) ──
+        self._approval_timer = QTimer()
+        self._approval_timer.timeout.connect(self._check_approval_queue)
+        self._approval_timer.start(300)
 
         status = QStatusBar()
         status.showMessage(
@@ -734,15 +717,16 @@ class MainWindow(QMainWindow):
         )
         self.setStatusBar(status)
 
-        def closeEvent(self, event):
-            self.fast_manager.stop()
-            self.slow_manager.stop()
-            self.discovery.stop()
-            self.inbox.stop()
-            event.accept()
+    # BUG FIX: closeEvent must be a class method, NOT a nested function inside __init__
+    def closeEvent(self, event):
+        self.fast_manager.stop()
+        self.slow_manager.stop()
+        self.discovery.stop()
+        self.inbox.stop()
+        event.accept()
 
     def _check_approval_queue(self):
-        """Check if any background track needs approval dialog shown."""
+        """Poll for background track approval requests and show dialog on main thread."""
         from ui.approval_queue import get_pending_request
         request = get_pending_request()
         if not request:
@@ -758,6 +742,11 @@ class MainWindow(QMainWindow):
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
+
+# BUG FIX: Module-level reference prevents Python GC from destroying the window
+_main_window = None
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("AutoApplyAI")
@@ -775,10 +764,14 @@ def main():
 
 
 def _show_main(app: QApplication):
-    window = MainWindow()
-    window.showMaximized()
-    window.raise_()
-    window.activateWindow()
+    global _main_window
+    # BUG FIX: store in module-level var so Python doesn't garbage-collect it
+    # Previously: window = MainWindow() — local var, GC'd instantly = invisible window
+    _main_window = MainWindow()
+    _main_window.showMaximized()
+    _main_window.raise_()
+    _main_window.activateWindow()
+
 
 if __name__ == "__main__":
     main()

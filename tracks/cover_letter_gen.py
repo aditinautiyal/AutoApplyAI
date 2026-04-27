@@ -41,7 +41,6 @@ def _build_user_context(store, profile: dict) -> str:
 
 
 def _get_advice_context(advice_type: str = "cover_letter") -> str:
-    """Pull top advice from DB for generation context."""
     try:
         from research.advice_scraper import get_advice_context_for_generation
         return get_advice_context_for_generation(advice_type)
@@ -96,6 +95,31 @@ def _build_insight_context(insight: dict) -> str:
     return "\n".join(parts)
 
 
+def _get_banned_project_names() -> list[str]:
+    """
+    Returns project names that must never appear in cover letters.
+    AutoApplyAI and any variant should never be mentioned — recruiters
+    seeing it would assume the application is bot-generated.
+    """
+    store = get_store()
+    # Core ban list — always enforced
+    banned = [
+        "AutoApplyAI",
+        "Auto Apply AI",
+        "AutoApply",
+        "auto apply",
+    ]
+    # Also pull any user-defined banned terms from settings
+    extra = store.get("cover_letter_banned_terms", [])
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = []
+    banned.extend(extra)
+    return banned
+
+
 def generate_cover_letter(
     job_title: str,
     company: str,
@@ -114,8 +138,22 @@ def generate_cover_letter(
     user_context = _build_user_context(store, profile)
     insight_context = _build_insight_context(insight)
     advice_context = _get_advice_context("cover_letter")
+    banned_names = _get_banned_project_names()
 
-    system = """You are an expert job application writer. Write cover letters that:
+    # Build the banned terms instruction string
+    banned_instruction = (
+        "- NEVER mention any of these project names under any circumstances, "
+        "even as examples of automation or AI work: "
+        + ", ".join(f'"{b}"' for b in banned_names)
+        + ". If referencing automation projects, describe the technical skills "
+        "involved (e.g. 'built an async Python automation pipeline') without naming "
+        "the project itself."
+    )
+
+    # Pull any custom instructions the user has set via AI Chat
+    custom_instructions = store.get("cover_letter_custom_instructions", "")
+
+    system = f"""You are an expert job application writer. Write cover letters that:
 - Sound like a real, thoughtful person wrote them — not AI-generated
 - Are specific to this exact company and role — not generic
 - Demonstrate genuine research into company culture and values
@@ -124,7 +162,9 @@ def generate_cover_letter(
 - Never start with "I am writing to express my interest" or similar
 - Start with something specific and engaging about the company or role
 - End with confident, forward-looking next steps
-- Incorporate proven best practices naturally, not mechanically"""
+- Incorporate proven best practices naturally, not mechanically
+{banned_instruction}
+{"Additional instructions: " + custom_instructions if custom_instructions else ""}"""
 
     prompt = f"""Write a cover letter for this application.
 
@@ -148,10 +188,11 @@ INSTRUCTIONS:
 - If there's a unique insight, weave it in to show depth of research
 - Sound enthusiastic but grounded — real, not performative
 - Do NOT start with "I am writing to apply"
-- Do NOT use as buzzwords: "passion", "leverage", "synergy", "dynamic", "innovative"
+- Do NOT use buzzwords: "passion", "leverage", "synergy", "dynamic", "innovative"
 - Keywords should appear naturally in sentences, not listed
 - Apply the proven advice but keep it feeling authentic
-- Write the full cover letter only — no subject line, no [placeholders]"""
+- Write the full cover letter only — no subject line, no [placeholders]
+- {banned_instruction}"""
 
     cover_letter = router.complete(
         prompt, system=system, smart=True, max_tokens=700
@@ -169,11 +210,15 @@ def generate_form_answer(
     """
     Generate an answer to a specific application form question.
     Checks learned_answers first. Falls back to Haiku generation.
-    Stores new answers for future reuse.
     """
     store = get_store()
+    banned_names = _get_banned_project_names()
+    banned_instruction = (
+        "Never mention these project names: "
+        + ", ".join(f'"{b}"' for b in banned_names)
+        + ". Describe technical skills without naming the project."
+    )
 
-    # Check stored answers first — reuse and adapt
     stored = store.find_learned_answer(question)
     if stored and len(stored) > 10:
         router = get_router()
@@ -193,6 +238,7 @@ Role: {job_title} at {company}
 Tone: {insight.get('tone', 'professional')}
 Company values: {', '.join(vals[:3]) if vals else ''}
 Max words: {max_words}
+{banned_instruction}
 
 Return only the adapted answer:"""
         try:
@@ -200,7 +246,6 @@ Return only the adapted answer:"""
         except Exception:
             return stored
 
-    # Generate fresh answer using Haiku
     router = get_router()
     profile = store.get_profile() or {}
     user_context = _build_user_context(store, profile)
@@ -229,12 +274,12 @@ Rules:
 - Specific, not generic
 - Relate to company values where relevant
 - Answer ONLY — no preamble like "Here is my answer:"
+- {banned_instruction}
 
 Answer:"""
 
     answer = router.complete(prompt, smart=False, max_tokens=350).strip()
 
-    # Store for future reuse
     store.save_learned_answer(
         question_pattern=question[:100],
         answer=answer,
@@ -252,12 +297,16 @@ def generate_cold_email_body(
 ) -> tuple[str, str]:
     """
     Generate subject + body for a cold outreach email.
-    Uses cold_email advice from advice DB.
     Returns (subject, body).
     """
     router = get_router()
     store = get_store()
     profile = store.get_profile() or {}
+    banned_names = _get_banned_project_names()
+    banned_instruction = (
+        "Never mention these project names: "
+        + ", ".join(f'"{b}"' for b in banned_names) + "."
+    )
 
     name = profile.get("full_name", "")
     background = (profile.get("background_text") or "")[:250]
@@ -277,9 +326,10 @@ def generate_cold_email_body(
     cold_email_advice = _get_advice_context("cold_email")
     greeting = f"Hi {recipient_name.split()[0]}," if recipient_name else "Hi there,"
 
-    system = """You write highly effective cold outreach emails for job applications.
+    system = f"""You write highly effective cold outreach emails for job applications.
 Keep them: brief (150-200 words), specific to the company, professional,
-and end with a clear single ask. Never use generic openers."""
+and end with a clear single ask. Never use generic openers.
+{banned_instruction}"""
 
     body_prompt = f"""Write a cold email from {name} to a recruiter at {company} about the {job_title} role.
 
@@ -297,11 +347,12 @@ Proven cold email tips to apply naturally:
 {cold_email_advice}
 
 Start with: {greeting}
-Body only, no subject. Under 200 words. Genuine and specific."""
+Body only, no subject. Under 200 words. Genuine and specific.
+{banned_instruction}"""
 
     body = router.complete(body_prompt, system=system, smart=False, max_tokens=400).strip()
 
-    subject_prompt = f"""One-line email subject for cold outreach from {name} 
+    subject_prompt = f"""One-line email subject for cold outreach from {name}
 about the {job_title} role at {company}.
 Under 55 characters. Specific and compelling. Return ONLY the subject text."""
 

@@ -6,7 +6,7 @@ Indeed, Handshake (public), USAJobs all provide RSS.
 
 import asyncio
 import hashlib
-import time
+import re
 import feedparser
 import httpx
 from discovery.job_pool import Job, JobScorer, get_pool
@@ -18,11 +18,8 @@ def _job_id(url: str) -> str:
 
 
 def _build_feed_urls(profile: dict) -> list[tuple[str, str]]:
-    """Build list of (feed_url, platform_name) from user preferences."""
     roles = profile.get("target_roles", "software engineer intern AI ML")
     locations = profile.get("locations", "Chicago,Dallas,Remote")
-
-    # Parse location list
     loc_list = [l.strip().replace(" ", "+") for l in locations.split(",")][:3]
 
     role_terms = [
@@ -31,30 +28,25 @@ def _build_feed_urls(profile: dict) -> list[tuple[str, str]]:
         "AI+intern",
         "data+science+intern",
         "computer+science+intern",
+        "software+developer+intern",
+        "python+developer+intern",
     ]
 
     feeds = []
 
-    # Indeed RSS (public, no auth)
-    for role in role_terms[:3]:
-        for loc in loc_list:
+    # Indeed RSS
+    for role in role_terms[:4]:
+        for loc in loc_list + ["remote"]:
             feeds.append((
                 f"https://www.indeed.com/rss?q={role}&l={loc}&sort=date",
                 "indeed"
             ))
 
-    # USAJobs RSS (federal/research positions)
-    for role in ["computer+scientist", "data+scientist", "artificial+intelligence"]:
+    # USAJobs RSS
+    for role in ["computer+scientist", "data+scientist", "artificial+intelligence", "software+engineer"]:
         feeds.append((
             f"https://www.usajobs.gov/Search/Results?k={role}&format=rss",
             "usajobs"
-        ))
-
-    # LinkedIn public job feeds (no auth needed for public listings)
-    for role in role_terms[:3]:
-        feeds.append((
-            f"https://www.linkedin.com/jobs/search/?keywords={role}&location=United+States&f_E=1&f_JT=I&format=rss",
-            "linkedin_public"
         ))
 
     return feeds
@@ -62,7 +54,6 @@ def _build_feed_urls(profile: dict) -> list[tuple[str, str]]:
 
 async def _parse_feed(feed_url: str, platform: str,
                        client: httpx.AsyncClient) -> list[dict]:
-    """Fetch and parse one RSS feed."""
     try:
         resp = await client.get(
             feed_url,
@@ -81,8 +72,6 @@ async def _parse_feed(feed_url: str, platform: str,
             description = getattr(entry, "summary", "")
             location = ""
 
-            # Try to extract location from description
-            import re
             loc_match = re.search(
                 r'(Remote|Chicago|Dallas|New York|San Francisco|Austin|Boston|\w+,\s*[A-Z]{2})',
                 description, re.IGNORECASE
@@ -90,7 +79,6 @@ async def _parse_feed(feed_url: str, platform: str,
             if loc_match:
                 location = loc_match.group(1)
 
-            # Try to extract company
             company = ""
             if " - " in title:
                 parts = title.rsplit(" - ", 1)
@@ -119,10 +107,6 @@ async def _parse_feed(feed_url: str, platform: str,
 
 
 async def run_rss_discovery(continuous: bool = True, stop_event=None):
-    """
-    Continuously parse RSS feeds and add jobs to pool.
-    Runs as background coroutine alongside Google discovery.
-    """
     store = get_store()
     pool = get_pool()
     scorer = JobScorer()
@@ -159,10 +143,12 @@ async def run_rss_discovery(continuous: bool = True, stop_event=None):
                     )
                     job.score = scorer.score(job)
 
-                    if job.score >= 4.0:
+                    # Use scorer's threshold instead of hardcoded value
+                    if scorer.passes_threshold(job.score):
                         was_added = pool.add(job)
                         if was_added:
                             added_total += 1
+                            print(f"[RSS] Added: {job.title} @ {job.company} (score: {job.score:.1f})")
 
                 await asyncio.sleep(2)
 
@@ -172,4 +158,4 @@ async def run_rss_discovery(continuous: bool = True, stop_event=None):
         if not continuous:
             break
 
-        await asyncio.sleep(300)  # Re-check feeds every 5 minutes
+        await asyncio.sleep(300)

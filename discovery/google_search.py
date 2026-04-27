@@ -1,23 +1,18 @@
 """
 discovery/google_search.py
 Discovers direct ATS job links via Google.
-Targets Greenhouse, Lever, Workday, and other ATS platforms directly.
-No login needed. Bypasses LinkedIn/Indeed entirely for bulk applying.
+Rate-limited to run once every 30 minutes to avoid IP blocks and control costs.
 """
 
 import asyncio
 import hashlib
-import time
 import random
 import re
 import httpx
 from bs4 import BeautifulSoup
-from typing import Generator
 from discovery.job_pool import Job, JobScorer, get_pool
 from core.settings_store import get_store
 
-
-# ATS domains to look for — applying here is untraceable to LinkedIn/Indeed
 ATS_DOMAINS = [
     "greenhouse.io/jobs",
     "lever.co/",
@@ -27,17 +22,26 @@ ATS_DOMAINS = [
     "boards.greenhouse.io",
     "jobs.lever.co",
     "smartrecruiters.com/jobs",
-    "careers.icims.com",
-    "jobvite.com/careers",
-    "taleo.net",
-    "brassring.com",
-    "successfactors.com",
 ]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+# Only run Google search every 30 minutes to avoid rate limiting and control costs
+GOOGLE_CYCLE_INTERVAL = 30 * 60  # 30 minutes between full cycles
+
+# Focused, high-value queries only — fewer queries = less rate limiting
+FOCUSED_QUERIES = [
+    'software engineer intern 2025 site:greenhouse.io OR site:lever.co',
+    'machine learning intern 2025 site:greenhouse.io OR site:lever.co',
+    'AI intern summer 2025 site:jobs.ashbyhq.com OR site:greenhouse.io',
+    'data science intern 2025 Chicago OR Dallas OR Remote site:greenhouse.io',
+    'software engineer intern remote 2025 site:lever.co OR site:greenhouse.io',
+    'computer science intern 2025 startup site:jobs.ashbyhq.com',
+    'python developer intern 2025 site:greenhouse.io',
+    'ML engineer intern 2025 site:lever.co',
 ]
 
 
@@ -45,66 +49,13 @@ def _job_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:12]
 
 
-def _build_queries(profile: dict) -> list[str]:
-    """Build diverse Google search queries for ATS job links."""
-    roles = profile.get("target_roles", "software engineering intern AI ML")
-    locations = profile.get("locations", "Chicago Dallas Remote")
-    loc_list = [l.strip() for l in locations.split(",")][:3]
-
-    ats_site_query = " OR ".join(
-        f'site:{d.split("/")[0]}' for d in ATS_DOMAINS[:6]
-    )
-
-    queries = []
-
-    # Direct ATS queries
-    for role in ["software engineer intern", "AI ML intern", "machine learning intern",
-                  "data science intern", "computer science intern"]:
-        for loc in loc_list + ["remote"]:
-            queries.append(
-                f'{role} {loc} ({ats_site_query})'
-            )
-
-    # Fellowship queries
-    queries.extend([
-        f'AI research fellowship 2025 apply ({ats_site_query})',
-        f'machine learning fellowship internship 2025 ({ats_site_query})',
-    ])
-
-    # Startup queries
-    queries.extend([
-        f'AI startup internship 2025 apply now Chicago OR Dallas OR remote',
-        f'early stage startup software intern 2025 apply',
-        f'YC startup hiring intern 2025 software AI',
-    ])
-
-    # Deep variety — forums, posts
-    queries.extend([
-        f'site:reddit.com r/cscareerquestions internship 2025 apply link',
-        f'site:reddit.com internship AI ML 2025 "apply here" OR "application link"',
-        f'site:news.ycombinator.com "who is hiring" 2025 intern',
-    ])
-
-    random.shuffle(queries)
-    return queries
-
-
-async def _google_search(query: str, num_results: int = 10) -> list[dict]:
-    """
-    Fetch Google search results for a query.
-    Returns list of {title, url, snippet} dicts.
-    """
+async def _google_search(query: str, num_results: int = 8) -> list[dict]:
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
-    params = {
-        "q": query,
-        "num": num_results,
-        "hl": "en",
-        "gl": "us",
-    }
+    params = {"q": query, "num": num_results, "hl": "en", "gl": "us"}
 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         try:
@@ -143,26 +94,11 @@ async def _google_search(query: str, num_results: int = 10) -> list[dict]:
             return []
 
 
-def _extract_ats_url(url: str, snippet: str, title: str) -> tuple[str, str]:
-    """
-    Try to identify a direct ATS application URL.
-    Returns (ats_url, platform_name).
-    """
-    for domain in ATS_DOMAINS:
-        platform_name = domain.split(".")[0].split("/")[0]
-        if domain.split("/")[0] in url:
-            return url, platform_name
-    # If not direct ATS, return original (still useful)
-    return url, "web"
-
-
 def _parse_job_from_result(result: dict) -> dict:
-    """Extract job info from a Google search result."""
     title = result["title"]
     url = result["url"]
     snippet = result["snippet"]
 
-    # Try to extract company name (usually in title like "Software Engineer - Acme Corp")
     company = ""
     if " - " in title:
         parts = title.rsplit(" - ", 1)
@@ -173,25 +109,25 @@ def _parse_job_from_result(result: dict) -> dict:
         company = title[len(parts[0]) + 4:].strip()
         title = title[:len(parts[0])].strip()
 
-    ats_url, platform = _extract_ats_url(url, snippet, title)
-
-    # Extract location from snippet
-    location = ""
-    loc_patterns = [
-        r'(Remote|Chicago|Dallas|New York|San Francisco|Austin|Seattle|Boston)',
-        r'(\w+,\s*[A-Z]{2})\b',
-    ]
-    for pattern in loc_patterns:
-        m = re.search(pattern, snippet, re.IGNORECASE)
-        if m:
-            location = m.group(1)
+    platform = "web"
+    for domain in ATS_DOMAINS:
+        if domain.split("/")[0] in url:
+            platform = domain.split(".")[0]
             break
+
+    location = ""
+    loc_match = re.search(
+        r'(Remote|Chicago|Dallas|New York|San Francisco|Austin|Seattle|Boston)',
+        snippet, re.IGNORECASE
+    )
+    if loc_match:
+        location = loc_match.group(1)
 
     return {
         "title": title or result["title"],
         "company": company,
         "url": url,
-        "ats_url": ats_url,
+        "ats_url": url,
         "platform": platform,
         "description": snippet,
         "location": location,
@@ -199,30 +135,28 @@ def _parse_job_from_result(result: dict) -> dict:
 
 
 async def run_google_discovery(continuous: bool = True, stop_event=None):
-    """
-    Main discovery loop. Continuously searches Google and adds to pool.
-    Runs as background coroutine.
-    """
     store = get_store()
     pool = get_pool()
     scorer = JobScorer()
-    profile = store.get_profile() or {}
 
-    print("[Discovery] Google ATS search starting...")
+    print("[GoogleSearch] Starting (rate-limited to 1 cycle per 30 min)...")
     iteration = 0
 
     while True:
         if stop_event and stop_event.is_set():
             break
 
-        queries = _build_queries(profile)
+        added = 0
+        # Shuffle queries and only run half per cycle to stay under rate limits
+        queries = FOCUSED_QUERIES.copy()
+        random.shuffle(queries)
+        queries_this_cycle = queries[:4]  # Only 4 queries per cycle
 
-        for query in queries:
+        for query in queries_this_cycle:
             if stop_event and stop_event.is_set():
                 break
 
-            results = await _google_search(query, num_results=10)
-            added = 0
+            results = await _google_search(query, num_results=8)
 
             for result in results:
                 job_data = _parse_job_from_result(result)
@@ -230,7 +164,7 @@ async def run_google_discovery(continuous: bool = True, stop_event=None):
                     continue
 
                 job = Job(
-                    score=0.0,  # will be scored below
+                    score=0.0,
                     job_id=_job_id(job_data["url"]),
                     title=job_data["title"],
                     company=job_data["company"],
@@ -240,25 +174,25 @@ async def run_google_discovery(continuous: bool = True, stop_event=None):
                     description=job_data["description"],
                     location=job_data["location"],
                 )
-
-                # Score it (uses fast Haiku call)
                 job.score = scorer.score(job)
 
-                # Only add if score >= 4.0 (not terrible fit)
-                if job.score >= 4.0:
-                    was_added = pool.add(job)
-                    if was_added:
+                if scorer.passes_threshold(job.score):
+                    if pool.add(job):
                         added += 1
-                        print(f"[Discovery] Added: {job.title} @ {job.company} (score: {job.score:.1f})")
+                        print(f"[GoogleSearch] Added: {job.title} @ {job.company} (score: {job.score:.1f})")
 
-            # Delay between queries — be respectful to Google
-            await asyncio.sleep(random.uniform(3, 8))
+            # Polite delay between queries
+            await asyncio.sleep(random.uniform(8, 15))
 
         iteration += 1
-        print(f"[Discovery] Cycle {iteration} complete. Pool size: {pool.size()}")
+        print(f"[GoogleSearch] Cycle {iteration}: +{added} jobs. Pool: {pool.size()}")
 
         if not continuous:
             break
 
-        # Wait before next full cycle
-        await asyncio.sleep(60)
+        # Wait 30 minutes before next cycle — this is what keeps costs low
+        print(f"[GoogleSearch] Sleeping 30 min before next cycle...")
+        for _ in range(GOOGLE_CYCLE_INTERVAL // 10):
+            if stop_event and stop_event.is_set():
+                break
+            await asyncio.sleep(10)

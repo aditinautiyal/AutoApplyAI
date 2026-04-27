@@ -2,7 +2,7 @@
 slow_lane/slow_lane_manager.py
 Manages both LinkedIn and Indeed slow lanes.
 Each runs in its own async loop in a background thread.
-Can be toggled on/off independently via settings.
+Only starts lanes that are explicitly enabled in settings.
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from core.settings_store import get_store
 class SlowLaneManager:
     """
     Runs LinkedIn + Indeed Easy Apply in background threads.
-    Human-paced, logged in, completely separate from fast tracks.
+    Only starts lanes that are checked in Settings → Automation.
     """
 
     def __init__(self, status_callback: Optional[Callable] = None):
@@ -26,28 +26,48 @@ class SlowLaneManager:
         self.running = False
         self.lane_statuses: dict[str, dict] = {}
 
-    def start(self):
-        """Start enabled slow lanes."""
-        if self.running:
-            return
-
+    def _get_enabled_platforms(self) -> list[str]:
+        """Read slow_platforms from DB and return as list."""
         slow_platforms = self.store.get("slow_platforms", [])
         if isinstance(slow_platforms, str):
             try:
                 slow_platforms = json.loads(slow_platforms)
             except Exception:
                 slow_platforms = []
+        if not isinstance(slow_platforms, list):
+            return []
+        return slow_platforms
+
+    def start(self):
+        """Start only the slow lanes that are enabled in settings."""
+        if self.running:
+            return
+
+        enabled = self._get_enabled_platforms()
+
+        # If neither is enabled, don't start anything — no threads, no errors
+        if not enabled:
+            print("[SlowLane] No slow lanes enabled — skipping")
+            self.running = True  # Mark running so stop() works cleanly
+            return
 
         self._stop_event.clear()
         self.running = True
 
-        if "LinkedIn Easy Apply" in slow_platforms:
+        if "LinkedIn Easy Apply" in enabled:
             self._start_lane("linkedin")
+        else:
+            print("[SlowLane] LinkedIn Easy Apply disabled — not starting")
 
-        if "Indeed Easy Apply" in slow_platforms:
+        if "Indeed Easy Apply" in enabled:
             self._start_lane("indeed")
+        else:
+            print("[SlowLane] Indeed Easy Apply disabled — not starting")
 
-        print(f"[SlowLane] Started: {list(self._threads.keys())}")
+        if self._threads:
+            print(f"[SlowLane] Started: {list(self._threads.keys())}")
+        else:
+            print("[SlowLane] No lanes started (all disabled)")
 
     def stop(self):
         """Stop all slow lanes."""
@@ -56,6 +76,7 @@ class SlowLaneManager:
         for name, thread in self._threads.items():
             thread.join(timeout=5)
         self._threads.clear()
+        self.lane_statuses.clear()
         print("[SlowLane] All lanes stopped")
 
     def toggle_lane(self, lane: str, enable: bool):
@@ -63,7 +84,6 @@ class SlowLaneManager:
         if enable and lane not in self._threads:
             self._start_lane(lane)
         elif not enable and lane in self._threads:
-            # Can't stop just one lane without its own event — mark as disabled
             self.store.set(f"slow_lane_{lane}_enabled", False)
 
     def get_status(self) -> dict:

@@ -20,11 +20,9 @@ from tracks.cover_letter_gen import (
 from tracks.humanizer_check import ensure_humanized
 from core.settings_store import get_store
 
-# Typing speed simulation — milliseconds per keystroke
 MIN_KEYSTROKE_MS = 40
 MAX_KEYSTROKE_MS = 160
 
-# Autofill fields — populated fast (like browser autofill)
 AUTOFILL_FIELDS = {
     "name", "full_name", "firstname", "lastname", "first_name", "last_name",
     "email", "phone", "telephone", "address", "city", "state", "zip", "zipcode"
@@ -87,17 +85,17 @@ class TrackWorker:
         try:
             # 1. Log application start
             app_id = self.store.log_application({
-                "job_title":   job.title,
+                "job_title":    job.title,
                 "company_name": job.company,
-                "job_url":     job.url,
-                "ats_url":     job.ats_url,
-                "platform":    job.platform,
-                "score":       job.score,
-                "track_id":    self.track_id,
-                "status":      "researching",
+                "job_url":      job.url,
+                "ats_url":      job.ats_url,
+                "platform":     job.platform,
+                "score":        job.score,
+                "track_id":     self.track_id,
+                "status":       "researching",
             })
 
-            # 2. Research the company (async, isolated to this track)
+            # 2. Research the company
             self._status("researching", f"Researching {job.company}...")
             research = await research_company(job.company, job.title, job.description)
             insight = synthesize(research)
@@ -116,8 +114,8 @@ class TrackWorker:
                 "status": "applying",
             })
 
-            # 4. Manual approval gate — if review mode is ON, show dialog
-            review_mode = self.store.get("review_mode", True)  # Default ON for safety
+            # 4. Manual approval gate
+            review_mode = self.store.get("review_mode", True)
             if review_mode:
                 self._status("waiting", f"⏳ Waiting for your approval — {job.company}")
                 action, cover_letter = await self._request_approval(
@@ -131,9 +129,8 @@ class TrackWorker:
                 elif action == "stop":
                     self.pool.mark_done(job.job_id, "skipped")
                     self.store.update_application(app_id, {"status": "skipped"})
-                    self._stop_event.set()
+                    self.stop_event.set()
                     return
-                # action == "approve" — continue with submission
                 self.store.update_application(app_id, {"cover_letter": cover_letter})
 
             # 5. Navigate to application form
@@ -152,12 +149,10 @@ class TrackWorker:
                 self._status("done", f"✅ Applied to {job.title} @ {job.company}")
                 print(f"[Track {self.track_id}] ✅ Submitted: {job.title} @ {job.company}")
 
-                # Post-submission background tasks — don't block next application
                 asyncio.create_task(
                     self._post_submission_actions(app_id, job, insight, cover_letter)
                 )
 
-                # Track advice usage for this submission
                 try:
                     from core.success_tracker import record_application_sent
                     record_application_sent(app_id)
@@ -175,13 +170,12 @@ class TrackWorker:
             raise
 
     async def _request_approval(self, job: Job, insight: dict,
-                             cover_letter: str, app_id: int) -> tuple[str, str]:
+                                 cover_letter: str, app_id: int) -> tuple[str, str]:
         """
         Show approval dialog on main Qt thread and wait for user response.
         Uses approval_queue for thread-safe communication.
         """
         from ui.approval_queue import request_approval
-        import concurrent.futures
 
         job_data = {
             "title":       job.title,
@@ -194,10 +188,397 @@ class TrackWorker:
             "score":       job.score,
         }
 
-        # Run blocking request in thread pool so async loop stays alive
         loop = asyncio.get_event_loop()
         action, edited_cl = await loop.run_in_executor(
             None, lambda: request_approval(job_data, insight, cover_letter)
         )
         return action, edited_cl
-        
+
+    async def _fill_and_submit_form(self, url: str, job: Job, insight: dict,
+                                     cover_letter: str, app_id: int) -> bool:
+        """
+        Navigate to application URL and fill/submit the form.
+        Handles Greenhouse, Lever, Workday, and generic ATS forms.
+        """
+        if not self.page:
+            return False
+
+        try:
+            await self.page.goto(url, wait_until="networkidle", timeout=30000)
+            await self._delay(2, 4)
+
+            profile = self.store.get_profile() or {}
+
+            # Detect platform from URL
+            platform = job.platform or ""
+            current_url = self.page.url
+
+            if "greenhouse" in current_url or "greenhouse" in platform:
+                return await self._fill_greenhouse(job, insight, cover_letter, profile, app_id)
+            elif "lever" in current_url or "lever" in platform:
+                return await self._fill_lever(job, insight, cover_letter, profile, app_id)
+            else:
+                return await self._fill_generic(job, insight, cover_letter, profile, app_id)
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Form fill error: {e}")
+            if app_id:
+                self.store.update_application(app_id, {
+                    "status": "paused",
+                    "paused_reason": f"Form fill error: {str(e)[:200]}"
+                })
+            return False
+
+    async def _fill_greenhouse(self, job: Job, insight: dict, cover_letter: str,
+                                profile: dict, app_id: int) -> bool:
+        """Fill a Greenhouse ATS application form."""
+        try:
+            # Wait for form to load
+            await self.page.wait_for_selector("form#application_form, #application-form", timeout=10000)
+            await self._delay(1, 2)
+
+            # Fill standard fields
+            await self._fill_field_by_id("first_name", profile.get("full_name", "").split()[0] if profile.get("full_name") else "")
+            await self._fill_field_by_id("last_name", profile.get("full_name", "").split()[-1] if profile.get("full_name") else "")
+            await self._fill_field_by_id("email", profile.get("email", ""))
+            await self._fill_field_by_id("phone", profile.get("phone", ""))
+
+            # Cover letter / resume text areas
+            cover_area = await self.page.query_selector("textarea[name*='cover'], textarea[id*='cover']")
+            if cover_area:
+                await cover_area.fill(cover_letter)
+                await self._delay(0.5, 1)
+
+            # Resume upload
+            resume_input = await self.page.query_selector("input[type='file'][name*='resume']")
+            if resume_input and profile.get("resume_path"):
+                try:
+                    await resume_input.set_input_files(profile["resume_path"])
+                    await self._delay(1, 2)
+                except Exception:
+                    pass
+
+            # Answer custom questions
+            await self._fill_custom_questions(job, insight, cover_letter, profile)
+
+            # Submit
+            submit_btn = await self.page.query_selector(
+                "input[type='submit'], button[type='submit'], button:has-text('Submit Application')"
+            )
+            if submit_btn:
+                await self._delay(1, 2)
+                await submit_btn.click()
+                await self._delay(3, 5)
+                return True
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Greenhouse error: {e}")
+
+        return False
+
+    async def _fill_lever(self, job: Job, insight: dict, cover_letter: str,
+                           profile: dict, app_id: int) -> bool:
+        """Fill a Lever ATS application form."""
+        try:
+            await self.page.wait_for_selector(".application-form, form", timeout=10000)
+            await self._delay(1, 2)
+
+            # Lever field selectors
+            await self._fill_field_by_placeholder("Full name", profile.get("full_name", ""))
+            await self._fill_field_by_placeholder("Email", profile.get("email", ""))
+            await self._fill_field_by_placeholder("Phone", profile.get("phone", ""))
+
+            # LinkedIn/Portfolio
+            linkedin = profile.get("linkedin_url", "")
+            if linkedin:
+                await self._fill_field_by_placeholder("LinkedIn", linkedin)
+
+            portfolio = profile.get("portfolio_url", "")
+            if portfolio:
+                await self._fill_field_by_placeholder("Website", portfolio)
+
+            # Cover letter
+            cover_area = await self.page.query_selector(
+                "textarea[placeholder*='cover'], textarea[data-field='comments']"
+            )
+            if cover_area:
+                await cover_area.fill(cover_letter)
+                await self._delay(0.5, 1)
+
+            # Resume upload
+            resume_input = await self.page.query_selector("input[type='file']")
+            if resume_input and profile.get("resume_path"):
+                try:
+                    await resume_input.set_input_files(profile["resume_path"])
+                    await self._delay(1, 2)
+                except Exception:
+                    pass
+
+            # Submit
+            submit_btn = await self.page.query_selector(
+                "button[type='submit'], button:has-text('Submit Application'), button:has-text('Apply')"
+            )
+            if submit_btn:
+                await self._delay(1, 2)
+                await submit_btn.click()
+                await self._delay(3, 5)
+
+                # Check for confirmation
+                confirm = await self.page.query_selector(
+                    ".success-message, h2:has-text('Application received'), h1:has-text('Thank you')"
+                )
+                return bool(confirm)
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Lever error: {e}")
+
+        return False
+
+    async def _fill_generic(self, job: Job, insight: dict, cover_letter: str,
+                             profile: dict, app_id: int) -> bool:
+        """Fill a generic / unknown ATS form using heuristic field mapping."""
+        try:
+            # Fill all visible text inputs using label/placeholder matching
+            inputs = await self.page.query_selector_all(
+                "input:not([type='hidden']):not([type='submit']):not([type='file']):not([type='checkbox']):not([type='radio']),"
+                "textarea"
+            )
+
+            for inp in inputs:
+                try:
+                    label_text = await self._get_label_text(inp)
+                    value = self._map_field_value(label_text.lower(), profile, cover_letter, insight)
+                    if value:
+                        tag = (await inp.evaluate("el => el.tagName")).lower()
+                        if tag == "textarea":
+                            await inp.fill(value)
+                        else:
+                            await self._type_human(inp, value)
+                        await self._delay(0.3, 0.8)
+                except Exception:
+                    continue
+
+            # Resume upload
+            file_input = await self.page.query_selector("input[type='file']")
+            if file_input and profile.get("resume_path"):
+                try:
+                    await file_input.set_input_files(profile["resume_path"])
+                    await self._delay(1, 2)
+                except Exception:
+                    pass
+
+            # Submit
+            submit_btn = await self.page.query_selector(
+                "input[type='submit'], button[type='submit'],"
+                "button:has-text('Submit'), button:has-text('Apply')"
+            )
+            if submit_btn:
+                await self._delay(1, 2)
+                await submit_btn.click()
+                await self._delay(3, 5)
+                return True
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Generic form error: {e}")
+
+        return False
+
+    async def _fill_custom_questions(self, job: Job, insight: dict,
+                                      cover_letter: str, profile: dict):
+        """Find and answer custom application questions using AI."""
+        try:
+            # Find question labels + their associated inputs
+            question_selectors = [
+                "label:not([for*='resume']):not([for*='name']):not([for*='email']):not([for*='phone'])",
+            ]
+            for selector in question_selectors:
+                labels = await self.page.query_selector_all(selector)
+                for label_el in labels[:10]:  # Max 10 custom questions
+                    try:
+                        question_text = await label_el.inner_text()
+                        if len(question_text.strip()) < 10:
+                            continue
+
+                        # Find the associated input
+                        label_for = await label_el.get_attribute("for")
+                        if label_for:
+                            inp = await self.page.query_selector(f"#{label_for}, [name='{label_for}']")
+                        else:
+                            inp = await label_el.evaluate_handle(
+                                "el => el.nextElementSibling"
+                            )
+
+                        if not inp:
+                            continue
+
+                        tag = await inp.evaluate("el => el.tagName.toLowerCase()")
+                        if tag not in ("input", "textarea", "select"):
+                            continue
+
+                        # Generate answer
+                        answer = generate_form_answer(
+                            question_text, job.title, job.company, insight
+                        )
+                        if answer:
+                            if tag == "select":
+                                try:
+                                    await inp.select_option(label=answer)
+                                except Exception:
+                                    pass
+                            else:
+                                await inp.fill(answer)
+                            await self._delay(0.5, 1.5)
+
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"[Track {self.track_id}] Custom questions error: {e}")
+
+    async def _post_submission_actions(self, app_id: int, job: Job,
+                                        insight: dict, cover_letter: str):
+        """
+        Background tasks after submission — don't block next application.
+        Find contacts, send cold email.
+        """
+        try:
+            # Find people to contact at this company
+            from extra_effort.people_finder import find_contacts_for_application
+            contacts = await find_contacts_for_application(
+                job.company, job.title, app_id, insight
+            )
+            if contacts:
+                print(f"[Track {self.track_id}] Found {len(contacts)} contacts for {job.company}")
+        except Exception as e:
+            print(f"[Track {self.track_id}] People finder error: {e}")
+
+        try:
+            # Send cold email if Gmail connected
+            from email_handler.gmail_sender import send_cold_email_for_application
+            send_cold_email_for_application(app_id, job.company, job.title, insight)
+        except Exception as e:
+            print(f"[Track {self.track_id}] Cold email error: {e}")
+
+    # ── Field helpers ──────────────────────────────────────────────────────────
+
+    async def _fill_field_by_id(self, field_id: str, value: str):
+        if not value:
+            return
+        try:
+            el = await self.page.query_selector(f"#{field_id}, [name='{field_id}']")
+            if el:
+                await el.fill(value)
+                await self._delay(0.3, 0.8)
+        except Exception:
+            pass
+
+    async def _fill_field_by_placeholder(self, placeholder: str, value: str):
+        if not value:
+            return
+        try:
+            el = await self.page.query_selector(
+                f"input[placeholder*='{placeholder}'], textarea[placeholder*='{placeholder}']"
+            )
+            if el:
+                await el.fill(value)
+                await self._delay(0.3, 0.8)
+        except Exception:
+            pass
+
+    async def _get_label_text(self, field_el) -> str:
+        """Get the label text for a form field."""
+        try:
+            field_id = await field_el.get_attribute("id")
+            if field_id:
+                label = await self.page.query_selector(f"label[for='{field_id}']")
+                if label:
+                    return await label.inner_text()
+            placeholder = await field_el.get_attribute("placeholder") or ""
+            name = await field_el.get_attribute("name") or ""
+            return placeholder or name
+        except Exception:
+            return ""
+
+    def _map_field_value(self, field_name: str, profile: dict,
+                          cover_letter: str, insight: dict) -> str:
+        """Map a field name/placeholder to the correct profile value."""
+        full_name = profile.get("full_name", "") or ""
+        mapping = {
+            "first":      full_name.split()[0] if full_name else "",
+            "last":       full_name.split()[-1] if full_name else "",
+            "name":       full_name,
+            "email":      profile.get("email", ""),
+            "phone":      profile.get("phone", ""),
+            "city":       (profile.get("address") or "").split(",")[0].strip(),
+            "linkedin":   profile.get("linkedin_url", ""),
+            "github":     profile.get("github_url", ""),
+            "website":    profile.get("portfolio_url", ""),
+            "portfolio":  profile.get("portfolio_url", ""),
+            "cover":      cover_letter,
+            "letter":     cover_letter,
+            "gpa":        profile.get("gpa", ""),
+            "graduation": profile.get("graduation_date", ""),
+            "authorized": "Yes",
+            "sponsor":    "No",
+            "salary":     str(profile.get("salary_min", 20)),
+        }
+        for key, value in mapping.items():
+            if key in field_name and value:
+                return str(value)
+
+        # Check learned answers DB
+        stored = self.store.find_learned_answer(field_name)
+        return stored or ""
+
+    async def _type_human(self, element, text: str):
+        """Type with human-like speed variation."""
+        try:
+            await element.click()
+            # Fast autofill for personal info, slower for text areas
+            for char in text:
+                delay = random.randint(MIN_KEYSTROKE_MS, MAX_KEYSTROKE_MS)
+                await element.type(char, delay=delay)
+                if random.random() < 0.03:  # Occasional pause
+                    await asyncio.sleep(random.uniform(0.1, 0.4))
+        except Exception:
+            # Fallback to fill() if type() fails
+            try:
+                await element.fill(text)
+            except Exception:
+                pass
+
+    async def _delay(self, min_s: float, max_s: float):
+        await asyncio.sleep(random.uniform(min_s, max_s))
+
+    # ── Browser lifecycle ──────────────────────────────────────────────────────
+
+    async def _init_browser(self):
+        """Initialize Playwright browser for this track."""
+        try:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self.context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=f"/tmp/autoapplyai_track_{self.track_id}",
+                headless=True,  # Fast tracks run headless
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            self.page = await self.context.new_page()
+            # Set realistic viewport and user agent
+            await self.page.set_viewport_size({"width": 1280, "height": 800})
+            print(f"[Track {self.track_id}] Browser initialized")
+        except Exception as e:
+            print(f"[Track {self.track_id}] Browser init failed: {e}")
+            self.page = None
+
+    async def _close_browser(self):
+        """Clean up browser resources."""
+        try:
+            if self.context:
+                await self.context.close()
+            if hasattr(self, "_playwright") and self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            pass
