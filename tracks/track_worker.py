@@ -176,28 +176,28 @@ class TrackWorker:
 
     async def _request_approval(self, job: Job, insight: dict,
                              cover_letter: str, app_id: int) -> tuple[str, str]:
-    """
-    Show approval dialog on main Qt thread and wait for user response.
-    Uses approval_queue for thread-safe communication.
-    """
-    from ui.approval_queue import request_approval
-    import concurrent.futures
+        """
+        Show approval dialog on main Qt thread and wait for user response.
+        Uses approval_queue for thread-safe communication.
+        """
+        from ui.approval_queue import request_approval
+        import concurrent.futures
 
-    job_data = {
-        "title":       job.title,
-        "company":     job.company,
-        "location":    job.location,
-        "platform":    job.platform,
-        "url":         job.url,
-        "ats_url":     job.ats_url,
-        "description": job.description,
-        "score":       job.score,
-    }
+        job_data = {
+            "title":       job.title,
+            "company":     job.company,
+            "location":    job.location,
+            "platform":    job.platform,
+            "url":         job.url,
+            "ats_url":     job.ats_url,
+            "description": job.description,
+            "score":       job.score,
+        }
 
-    # Run blocking request in thread pool so async loop stays alive
-    loop = asyncio.get_event_loop()
-    action, edited_cl = await loop.run_in_executor(
-        None, lambda: request_approval(job_data, insight, cover_letter)
-    )
-    return action, edited_cl
-    
+        # Run blocking request in thread pool so async loop stays alive
+        loop = asyncio.get_event_loop()
+        action, edited_cl = await loop.run_in_executor(
+            None, lambda: request_approval(job_data, insight, cover_letter)
+        )
+        return action, edited_cl
+        

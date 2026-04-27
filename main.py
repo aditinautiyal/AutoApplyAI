@@ -734,12 +734,12 @@ class MainWindow(QMainWindow):
         )
         self.setStatusBar(status)
 
-    def closeEvent(self, event):
-    self.fast_manager.stop()
-    self.slow_manager.stop()
-    self.discovery.stop()
-    self.inbox.stop()
-    event.accept()
+        def closeEvent(self, event):
+            self.fast_manager.stop()
+            self.slow_manager.stop()
+            self.discovery.stop()
+            self.inbox.stop()
+            event.accept()
 
     def _check_approval_queue(self):
         """Check if any background track needs approval dialog shown."""
