@@ -149,9 +149,17 @@ class DashboardTab(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_all)
 
+        # Review mode toggle — ON by default for safety
+        from PyQt6.QtWidgets import QCheckBox
+        self.review_toggle = QCheckBox("🔍 Review each application before submitting")
+        self.review_toggle.setChecked(True)
+        self.review_toggle.setStyleSheet(f"color: {YELLOW}; font-weight: bold;")
+        self.review_toggle.stateChanged.connect(self._toggle_review_mode)
+
         header.addWidget(self.start_btn)
         header.addWidget(self.stop_btn)
         layout.addLayout(header)
+        layout.addWidget(self.review_toggle)
 
         # ── Stat cards ──
         stats_row = QHBoxLayout()
@@ -239,6 +247,16 @@ class DashboardTab(QWidget):
             v = card.findChild(QLabel, "value")
             if v:
                 v.setText(value)
+
+    def _toggle_review_mode(self, state):
+        enabled = bool(state)
+        self.store.set("review_mode", enabled)
+        if enabled:
+            self.review_toggle.setStyleSheet(f"color: {YELLOW}; font-weight: bold;")
+            self._append_log("🔍 Review mode ON — you will approve every application")
+        else:
+            self.review_toggle.setStyleSheet(f"color: {MUTED};")
+            self._append_log("⚡ Review mode OFF — applications submit automatically")
 
     def _start_all(self):
         store = self.store
@@ -738,8 +756,9 @@ def main():
 
 def _show_main(app: QApplication):
     window = MainWindow()
-    window.show()
-
+    window.showMaximized()
+    window.raise_()
+    window.activateWindow()
 
 if __name__ == "__main__":
     main()
