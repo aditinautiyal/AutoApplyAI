@@ -1,9 +1,8 @@
 """
 research/company_researcher.py
 Deep internet research on a company before every application.
-NOT rigid searches. Casts widest net across forums, comments, social, news.
-Weak signals aggregated — frequency = weight.
-Results stored in company_profiles for reuse.
+Capped at 3 minutes max — never hangs the track pipeline.
+Falls back to minimal insight if research times out or fails.
 """
 
 import asyncio
@@ -21,27 +20,27 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
 ]
 
-MAX_SOURCES = 20      # Max pages to scrape per company
-MAX_TEXT_PER_SOURCE = 2000  # Characters per source (token efficiency)
+# Hard limits — research must never block the pipeline
+MAX_SOURCES = 5           # Reduced from 20 — fewer sources, faster
+MAX_TEXT_PER_SOURCE = 1500
+RESEARCH_TIMEOUT = 90     # 90 seconds max for entire research phase
+FETCH_TIMEOUT = 8         # 8 seconds per individual URL fetch
 
 
 async def _fetch_page(url: str, client: httpx.AsyncClient) -> str:
-    """Fetch a URL and return cleaned text."""
     try:
         resp = await client.get(
             url,
             headers={"User-Agent": random.choice(USER_AGENTS)},
-            timeout=12,
+            timeout=FETCH_TIMEOUT,
             follow_redirects=True,
         )
         if resp.status_code != 200:
             return ""
         soup = BeautifulSoup(resp.text, "lxml")
-        # Remove script/style
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
-        # Collapse whitespace
         text = re.sub(r'\s+', ' ', text)
         return text[:MAX_TEXT_PER_SOURCE]
     except Exception:
@@ -49,14 +48,13 @@ async def _fetch_page(url: str, client: httpx.AsyncClient) -> str:
 
 
 async def _google_search_raw(query: str, client: httpx.AsyncClient,
-                               num: int = 8) -> list[dict]:
-    """Raw Google search returning result list."""
+                               num: int = 5) -> list[dict]:
     try:
         resp = await client.get(
             "https://www.google.com/search",
             params={"q": query, "num": num, "hl": "en"},
             headers={"User-Agent": random.choice(USER_AGENTS)},
-            timeout=12,
+            timeout=FETCH_TIMEOUT,
         )
         soup = BeautifulSoup(resp.text, "lxml")
         results = []
@@ -68,89 +66,39 @@ async def _google_search_raw(query: str, client: httpx.AsyncClient,
                     "url": a["href"],
                     "snippet": snippet.get_text(strip=True) if snippet else "",
                 })
-        return results
+        return results[:5]
     except Exception:
         return []
 
 
 def _build_research_queries(company: str, job_title: str) -> list[str]:
-    """
-    Build diverse, broad research queries.
-    NOT just interview tips — we want casual mentions, opinions, feelings.
-    """
+    """Focused queries only — fewer is better to avoid rate limiting."""
     c = company
-    j = job_title
-
     return [
-        # Casual mentions — the gold standard
-        f'"{c}" site:reddit.com',
-        f'"{c}" "{j}" site:reddit.com',
-        f'site:reddit.com "{c}" employees OR working OR culture OR love OR hate OR salary',
-        f'"{c}" glassdoor reviews culture values',
-        f'"{c}" linkedin employees posts',
-
-        # What the company actually cares about
-        f'"{c}" mission values what we look for engineers',
-        f'"{c}" engineering blog technical culture',
-        f'"{c}" about us team culture why work here',
-        f'"{c}" press release 2024 OR 2025',
-
-        # Job-specific research
-        f'"{c}" "{j}" interview experience',
-        f'"{c}" "{j}" what do you do day to day',
-        f'working at "{c}" as {j} OR similar role',
-
-        # Off-hand mentions in broader threads
-        f'site:reddit.com "{c}" "I work at" OR "I worked at" OR "my job at"',
-        f'site:reddit.com "best part of working at {c}" OR "worst part of working at {c}"',
-        f'"{c}" hackernews OR ycombinator',
-        f'site:news.ycombinator.com "{c}"',
-
-        # Quora and forums
-        f'site:quora.com "{c}"',
-        f'"{c}" what do they value interview tips 2024 2025',
-
-        # Company social presence
-        f'"{c}" twitter OR linkedin posts 2024 2025',
-        f'"{c}" CEO OR founder interview podcast',
-        f'"{c}" news layoffs OR growth OR funding OR hiring 2024 2025',
-
-        # Startup-specific (if startup)
-        f'"{c}" crunchbase funding team',
-        f'"{c}" yc OR sequoia OR a16z OR techcrunch',
+        f'"{c}" site:reddit.com culture employees',
+        f'"{c}" glassdoor reviews',
+        f'"{c}" mission values engineers',
+        f'"{c}" engineering blog',
+        f'site:reddit.com "{c}" "I work at" OR "I worked at"',
     ]
 
 
-async def research_company(company: str, job_title: str,
-                             job_description: str = "") -> dict:
+async def _do_research(company: str, job_title: str,
+                        job_description: str) -> dict:
     """
-    Full async research pipeline for one company+role.
-    Returns structured research dict ready for insight synthesis.
+    Inner research coroutine — wrapped in timeout by research_company().
     """
-    store = get_store()
-
-    # Check if we already have recent data (within 7 days)
-    existing = store.get_company_profile(company)
-    if existing and existing.get("last_updated"):
-        age_days = (time.time() - time.mktime(
-            time.strptime(existing["last_updated"], "%Y-%m-%d %H:%M:%S")
-        )) / 86400
-        if age_days < 7:
-            print(f"[Research] Using cached profile for {company} ({age_days:.1f}d old)")
-            return _cached_to_research(existing, job_title)
-
-    print(f"[Research] Starting deep research: {company} / {job_title}")
     queries = _build_research_queries(company, job_title)
     all_snippets = []
     all_text = []
     sources_used = 0
 
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=True) as client:
         for query in queries:
             if sources_used >= MAX_SOURCES:
                 break
 
-            results = await _google_search_raw(query, client, num=5)
+            results = await _google_search_raw(query, client, num=4)
 
             for result in results:
                 if sources_used >= MAX_SOURCES:
@@ -160,22 +108,21 @@ async def research_company(company: str, job_title: str,
                 if snippet and len(snippet) > 30:
                     all_snippets.append(snippet)
 
-                # Fetch full page for high-value sources
                 url = result["url"]
                 if any(domain in url for domain in [
-                    "reddit.com", "glassdoor.com", "linkedin.com",
-                    "news.ycombinator.com", "quora.com", company.lower().replace(" ", "")
+                    "reddit.com", "glassdoor.com",
+                    "news.ycombinator.com",
                 ]):
                     page_text = await _fetch_page(url, client)
                     if page_text:
                         all_text.append(f"[Source: {url[:60]}]\n{page_text}")
                         sources_used += 1
 
-                await asyncio.sleep(random.uniform(0.5, 1.5))
+                await asyncio.sleep(random.uniform(0.5, 1.0))
 
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            await asyncio.sleep(random.uniform(1.0, 2.0))
 
-    research_data = {
+    return {
         "company": company,
         "job_title": job_title,
         "snippets": all_snippets,
@@ -184,12 +131,64 @@ async def research_company(company: str, job_title: str,
         "job_description": job_description,
     }
 
-    print(f"[Research] Complete: {company} — {sources_used} sources, {len(all_snippets)} snippets")
-    return research_data
+
+async def research_company(company: str, job_title: str,
+                             job_description: str = "") -> dict:
+    """
+    Full async research pipeline for one company+role.
+    Hard timeout of 90 seconds — falls back to minimal insight if exceeded.
+    Never blocks the track pipeline.
+    """
+    store = get_store()
+
+    # Check cache first (within 7 days)
+    existing = store.get_company_profile(company)
+    if existing and existing.get("last_updated"):
+        try:
+            age_days = (time.time() - time.mktime(
+                time.strptime(existing["last_updated"], "%Y-%m-%d %H:%M:%S")
+            )) / 86400
+            if age_days < 7:
+                print(f"[Research] Using cached profile for {company}")
+                return _cached_to_research(existing, job_title)
+        except Exception:
+            pass
+
+    print(f"[Research] Researching {company} (90s timeout)...")
+
+    try:
+        # Hard timeout — research MUST complete within 90 seconds
+        research_data = await asyncio.wait_for(
+            _do_research(company, job_title, job_description),
+            timeout=RESEARCH_TIMEOUT
+        )
+        print(f"[Research] Done: {company} — {research_data['sources_count']} sources")
+        return research_data
+
+    except asyncio.TimeoutError:
+        print(f"[Research] Timeout for {company} — using minimal insight")
+        return {
+            "company": company,
+            "job_title": job_title,
+            "snippets": [],
+            "full_texts": [],
+            "sources_count": 0,
+            "job_description": job_description,
+            "timed_out": True,
+        }
+    except Exception as e:
+        print(f"[Research] Error for {company}: {e} — using minimal insight")
+        return {
+            "company": company,
+            "job_title": job_title,
+            "snippets": [],
+            "full_texts": [],
+            "sources_count": 0,
+            "job_description": job_description,
+        }
 
 
 def _cached_to_research(cached: dict, job_title: str) -> dict:
-    """Convert a cached company profile back to research format."""
     return {
         "company": cached["company_name"],
         "job_title": job_title,
