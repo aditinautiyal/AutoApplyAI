@@ -720,6 +720,11 @@ class MainWindow(QMainWindow):
         tabs.addTab(ResearchLibraryTab(),                    "📚 Research Library")
         tabs.addTab(AIChatTab(self.fast_manager, self.slow_manager), "🤖 AI Chat")
         tabs.addTab(SettingsTab(),                           "⚙️ Settings")
+        # Approval dialog queue checker
+        from PyQt6.QtCore import QTimer as _ApprovalTimer
+        self._approval_timer = _ApprovalTimer()
+        self._approval_timer.timeout.connect(self._check_approval_queue)
+        self._approval_timer.start(300)
 
         self.setCentralWidget(tabs)
 
@@ -730,11 +735,26 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
 
     def closeEvent(self, event):
-        self.fast_manager.stop()
-        self.slow_manager.stop()
-        self.discovery.stop()
-        self.inbox.stop()
-        event.accept()
+    self.fast_manager.stop()
+    self.slow_manager.stop()
+    self.discovery.stop()
+    self.inbox.stop()
+    event.accept()
+
+    def _check_approval_queue(self):
+        """Check if any background track needs approval dialog shown."""
+        from ui.approval_queue import get_pending_request
+        request = get_pending_request()
+        if not request:
+            return
+        job_data, insight, cover_letter, done_event, result = request
+        from ui.approval_dialog import ApprovalDialog
+        dialog = ApprovalDialog(job_data, insight, cover_letter, self)
+        dialog.exec()
+        action, edited_cl = dialog.get_result()
+        result["action"] = action
+        result["cover_letter"] = edited_cl
+        done_event.set()
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
