@@ -2,10 +2,12 @@
 discovery/api_discovery.py
 Free job API discovery — no scraping, no rate limits, no IP blocks.
 
-KEY FIX: The Muse returns landing page URLs, not direct application forms.
-_resolve_ats_url() fetches each Muse job page, finds the real ATS link
-(Greenhouse/Lever/Workday/Apple Jobs), and stores THAT as ats_url so the
-track worker lands directly on the actual application form.
+KEY FIXES:
+1. Follows full redirect chains to get the real final ATS URL
+2. Filters out companies whose portals require 2FA/Apple ID/Google account
+   (Apple, Google, Amazon, Microsoft, Meta, etc.) — these can never be
+   automated and waste track slots
+3. Only queues jobs where the final URL is a known automatable ATS
 """
 
 import asyncio
@@ -19,13 +21,45 @@ from core.settings_store import get_store
 CYCLE_INTERVAL = 20 * 60
 REQUEST_TIMEOUT = 20
 
-# Known ATS domains — if a URL contains one of these it's a direct form link
-ATS_DOMAINS = [
-    "greenhouse.io", "lever.co", "myworkdayjobs.com", "jobs.ashbyhq.com",
-    "apply.workable.com", "smartrecruiters.com", "icims.com", "taleo.net",
-    "jobs.apple.com", "careers.google.com", "amazon.jobs", "microsoft.com/careers",
-    "meta.com/careers", "linkedin.com/jobs", "jobs.lever.co", "boards.greenhouse.io",
-    "job-boards.greenhouse.io", "jobs.jobvite.com", "bamboohr.com",
+# ── Automatable ATS domains — track worker can fill these forms ───────────────
+AUTOMATABLE_ATS = [
+    "greenhouse.io",
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "lever.co",
+    "jobs.lever.co",
+    "myworkdayjobs.com",
+    "jobs.ashbyhq.com",
+    "apply.workable.com",
+    "smartrecruiters.com",
+    "icims.com",
+    "taleo.net",
+    "jobvite.com",
+    "bamboohr.com",
+    "recruiting.ultipro.com",
+    "jazz.co",
+    "breezy.hr",
+    "hire.trakstar.com",
+    "recruitee.com",
+    "pinpointhq.com",
+    "dover.com",
+]
+
+# ── Companies whose portals require Apple ID / Google account / 2FA ───────────
+# These cannot be automated — skip them entirely
+UNAUTOMATABLE_COMPANIES = [
+    "apple", "google", "alphabet", "amazon", "meta", "facebook",
+    "microsoft", "netflix", "twitter", "x corp", "uber", "lyft",
+    "salesforce", "oracle", "sap", "ibm", "cisco", "intel",
+    "qualcomm", "nvidia",   # These use Workday but with heavy auth layers
+]
+
+# ── Redirect/tracking domains that need to be followed through ────────────────
+REDIRECT_DOMAINS = [
+    "recruitics.com", "jobvite.com/redirect", "click.appcast.io",
+    "jobs.smartrecruiters.com/redirect", "go.greenhouse.io",
+    "wd1.myworkdayjobs.com/redirect", "t.co/", "bit.ly/",
+    "apply.indeed.com/redirect", "click.appcast.io",
 ]
 
 BAD_TITLE_KEYWORDS = [
@@ -80,10 +114,22 @@ def _job_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:12]
 
 
-def _is_ats_url(url: str) -> bool:
-    """Returns True if this URL is a direct ATS application form."""
+def _is_automatable_ats(url: str) -> bool:
+    """Returns True if this URL points to an ATS we can automate."""
     url_lower = url.lower()
-    return any(domain in url_lower for domain in ATS_DOMAINS)
+    return any(ats in url_lower for ats in AUTOMATABLE_ATS)
+
+
+def _is_unautomatable_company(company: str) -> bool:
+    """Returns True if this company's portal cannot be automated."""
+    company_lower = company.lower()
+    return any(bad in company_lower for bad in UNAUTOMATABLE_COMPANIES)
+
+
+def _is_redirect_url(url: str) -> bool:
+    """Returns True if this URL is a tracking/redirect link needing resolution."""
+    url_lower = url.lower()
+    return any(redir in url_lower for redir in REDIRECT_DOMAINS)
 
 
 def _passes_hard_filters(title: str, location: str, description: str = "") -> bool:
@@ -106,106 +152,112 @@ def _passes_hard_filters(title: str, location: str, description: str = "") -> bo
     return True
 
 
-# ─── ATS URL Resolver ─────────────────────────────────────────────────────────
+# ─── URL Resolution ───────────────────────────────────────────────────────────
 
-async def _resolve_ats_url(muse_url: str, client: httpx.AsyncClient) -> str:
+async def _follow_redirects_to_ats(url: str, client: httpx.AsyncClient,
+                                    max_hops: int = 5) -> str:
     """
-    Fetches a Muse job landing page and extracts the real ATS application URL.
-    The Muse shows an "Apply on Company Site" button that links to the actual form.
-
-    Returns the real ATS URL, or the original Muse URL if resolution fails.
+    Follow a URL through all redirects until we reach a final ATS URL.
+    Returns the final URL, or original if resolution fails.
     """
-    try:
-        resp = await client.get(
-            muse_url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=15,
-            follow_redirects=True,
-        )
-        if resp.status_code != 200:
-            return muse_url
+    current = url
+    for hop in range(max_hops):
+        try:
+            resp = await client.get(
+                current,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                },
+                timeout=12,
+                follow_redirects=True,
+            )
 
-        soup = BeautifulSoup(resp.text, "lxml")
+            final_url = str(resp.url)
 
-        # Strategy 1: Find direct ATS links in the page
-        for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            if _is_ats_url(href):
-                return href
+            # If we landed on an automatable ATS, we're done
+            if _is_automatable_ats(final_url):
+                return final_url
 
-        # Strategy 2: Look for apply button with data attributes
-        for el in soup.find_all(attrs={"data-apply-url": True}):
-            url = el.get("data-apply-url", "")
-            if url and url.startswith("http"):
-                return url
+            # If we're still on a redirect/tracking page, parse for the next URL
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "lxml")
 
-        # Strategy 3: Look for apply button by text
-        for a in soup.find_all("a", href=True):
-            text = a.get_text(strip=True).lower()
-            if any(phrase in text for phrase in [
-                "apply on company site", "apply now", "apply here",
-                "apply on", "apply at", "apply for this job"
-            ]):
-                href = a.get("href", "")
-                if href and href.startswith("http") and "themuse.com" not in href:
-                    return href
+                # Strategy 1: Find ATS links directly in the page
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if _is_automatable_ats(href):
+                        return href
 
-        # Strategy 4: Scan all script tags for ATS URLs
-        for script in soup.find_all("script"):
-            content = script.string or ""
-            for domain in ATS_DOMAINS:
-                match = re.search(
-                    rf'https?://[^\s\'"]+{re.escape(domain)}[^\s\'"]*',
-                    content
-                )
-                if match:
-                    return match.group(0)
+                # Strategy 2: meta refresh redirect
+                meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+                if meta:
+                    content = meta.get("content", "")
+                    url_match = re.search(r'url=(.+)', content, re.I)
+                    if url_match:
+                        current = url_match.group(1).strip("'\"")
+                        continue
 
-        # Couldn't resolve — return original
-        return muse_url
+                # Strategy 3: Apply button
+                for a in soup.find_all("a", href=True):
+                    text = a.get_text(strip=True).lower()
+                    href = a.get("href", "")
+                    if (any(phrase in text for phrase in [
+                        "apply on company site", "apply now", "apply here",
+                        "apply for this job", "apply on"
+                    ]) and href.startswith("http") and "themuse.com" not in href):
+                        current = href
+                        break
+                else:
+                    # No more hops possible
+                    return final_url
 
-    except Exception as e:
-        print(f"[APIdiscovery] URL resolve error for {muse_url[:60]}: {e}")
-        return muse_url
+            else:
+                return final_url
+
+        except Exception as e:
+            return current
+
+    return current
 
 
-async def _resolve_batch(jobs: list[dict], client: httpx.AsyncClient) -> list[dict]:
+async def _resolve_muse_jobs(jobs: list[dict],
+                              client: httpx.AsyncClient) -> list[dict]:
     """
-    Resolves ATS URLs for a batch of Muse jobs concurrently.
-    Replaces ats_url with the real application form URL.
+    For each Muse job:
+    1. Follow the landing page to find the real ATS URL
+    2. Filter out unautomatable companies
+    3. Filter out jobs where final URL is not a known automatable ATS
     """
-    async def resolve_one(job_data: dict) -> dict:
+    semaphore = asyncio.Semaphore(4)
+    resolved = []
+
+    async def process_one(job_data: dict) -> dict | None:
+        company = job_data.get("company", "")
         muse_url = job_data.get("url", "")
-        if not muse_url or "themuse.com" not in muse_url:
-            return job_data
 
-        real_url = await _resolve_ats_url(muse_url, client)
-        if real_url and real_url != muse_url:
-            print(f"[APIdiscovery] Resolved: {job_data.get('company', '')} → {real_url[:60]}")
-            job_data["ats_url"] = real_url
-        else:
-            # Could not resolve — mark so track_worker knows to click Apply button
-            job_data["ats_url"] = muse_url
-            job_data["needs_click_apply"] = True
+        # Skip unautomatable companies immediately
+        if _is_unautomatable_company(company):
+            print(f"[APIdiscovery] Skipped (unautomatable portal): {company}")
+            return None
 
-        return job_data
-
-    # Run resolutions concurrently, max 5 at a time to be polite
-    semaphore = asyncio.Semaphore(5)
-
-    async def safe_resolve(job_data):
         async with semaphore:
-            result = await resolve_one(job_data)
+            final_url = await _follow_redirects_to_ats(muse_url, client)
             await asyncio.sleep(0.5)
-            return result
 
-    return await asyncio.gather(*[safe_resolve(j) for j in jobs])
+        if _is_automatable_ats(final_url):
+            job_data["ats_url"] = final_url
+            print(f"[APIdiscovery] ✅ Resolved: {company} → {final_url[:65]}")
+            return job_data
+        else:
+            print(f"[APIdiscovery] ⛔ No automatable ATS found for {company} "
+                  f"({final_url[:50]})")
+            return None
+
+    results = await asyncio.gather(*[process_one(j) for j in jobs])
+    return [r for r in results if r is not None]
 
 
 # ─── The Muse API ─────────────────────────────────────────────────────────────
@@ -249,7 +301,7 @@ async def _fetch_muse_all(client: httpx.AsyncClient) -> list[dict]:
                         "title": title,
                         "company": company,
                         "url": url,
-                        "ats_url": url,  # Will be resolved below
+                        "ats_url": url,
                         "description": (
                             f"{title} at {company}. {level} {category}. "
                             f"Location: {location}."
@@ -270,7 +322,7 @@ async def _fetch_muse_all(client: httpx.AsyncClient) -> list[dict]:
 # ─── Remotive API ─────────────────────────────────────────────────────────────
 
 async def _fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
-    """Remotive remote tech jobs — junior/intern level only. Direct ATS links."""
+    """Remotive remote tech jobs — junior/intern only. Links go directly to ATS."""
     categories = ["software-dev", "data", "devops-sysadmin", "product"]
     jobs = []
     seen_urls = set()
@@ -297,6 +349,9 @@ async def _fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
                 if not title or not url or url in seen_urls:
                     continue
 
+                if _is_unautomatable_company(company):
+                    continue
+
                 combined = (title + " " + desc[:200] + " " + " ".join(tags)).lower()
                 if not any(sig in combined for sig in JUNIOR_SIGNALS):
                     continue
@@ -306,7 +361,7 @@ async def _fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
                     "title": title,
                     "company": company,
                     "url": url,
-                    "ats_url": url,  # Remotive links go directly to ATS
+                    "ats_url": url,
                     "description": desc[:400],
                     "location": "Remote",
                     "platform": "remotive",
@@ -324,7 +379,7 @@ async def _fetch_remotive(client: httpx.AsyncClient) -> list[dict]:
 # ─── USAJobs API ──────────────────────────────────────────────────────────────
 
 async def _fetch_usajobs(client: httpx.AsyncClient) -> list[dict]:
-    """USAJobs REST API — government CS internships. Direct application URLs."""
+    """USAJobs REST API — government CS internships with direct apply URLs."""
     terms = [
         "computer scientist intern",
         "data scientist intern",
@@ -339,7 +394,10 @@ async def _fetch_usajobs(client: httpx.AsyncClient) -> list[dict]:
             resp = await client.get(
                 "https://data.usajobs.gov/api/search",
                 params={"Keyword": term, "ResultsPerPage": 10, "WhoMayApply": "all"},
-                headers={"Host": "data.usajobs.gov", "User-Agent": "aditi.b.nautiyal@gmail.com"},
+                headers={
+                    "Host": "data.usajobs.gov",
+                    "User-Agent": "aditi.b.nautiyal@gmail.com",
+                },
                 timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code != 200:
@@ -349,14 +407,14 @@ async def _fetch_usajobs(client: httpx.AsyncClient) -> list[dict]:
             data  = resp.json()
             items = data.get("SearchResult", {}).get("SearchResultItems", [])
             for item in items:
-                mv       = item.get("MatchedObjectDescriptor", {})
-                title    = mv.get("PositionTitle", "")
-                company  = mv.get("OrganizationName", "US Government")
-                url      = mv.get("PositionURI", "")
+                mv        = item.get("MatchedObjectDescriptor", {})
+                title     = mv.get("PositionTitle", "")
+                company   = mv.get("OrganizationName", "US Government")
+                url       = mv.get("PositionURI", "")
                 apply_url = mv.get("ApplyURI", [url])[0] if mv.get("ApplyURI") else url
-                loc_list = mv.get("PositionLocation", [])
-                location = loc_list[0].get("LocationName", "USA") if loc_list else "USA"
-                desc     = mv.get("QualificationSummary", "")[:400]
+                loc_list  = mv.get("PositionLocation", [])
+                location  = loc_list[0].get("LocationName", "USA") if loc_list else "USA"
+                desc      = mv.get("QualificationSummary", "")[:400]
 
                 if not title or not url or url in seen_urls:
                     continue
@@ -366,7 +424,7 @@ async def _fetch_usajobs(client: httpx.AsyncClient) -> list[dict]:
                     "title": title,
                     "company": f"{company} (US Gov)",
                     "url": url,
-                    "ats_url": apply_url,  # USAJobs has direct apply URLs
+                    "ats_url": apply_url,
                     "description": f"{company}: {desc}",
                     "location": location,
                     "platform": "usajobs",
@@ -386,7 +444,8 @@ async def _fetch_usajobs(client: httpx.AsyncClient) -> list[dict]:
 async def run_api_discovery(continuous: bool = True, stop_event=None):
     """
     Main API discovery loop.
-    Fetches broadly → hard filters → resolves real ATS URLs → queues.
+    Fetches → hard filters → resolves real ATS URLs → filters unautomatable
+    → queues only jobs with confirmed working automatable ATS URLs.
     """
     pool   = get_pool()
     scorer = JobScorer()
@@ -398,9 +457,10 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
         if stop_event and stop_event.is_set():
             break
 
-        added_total    = 0
-        rejected_total = 0
-        all_jobs       = []
+        added_total        = 0
+        hard_rejected      = 0
+        ats_rejected       = 0
+        all_jobs           = []
 
         async with httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT,
@@ -408,7 +468,7 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
             headers={"User-Agent": "AutoApplyAI Job Discovery/1.0"},
         ) as client:
 
-            # Fetch raw jobs
+            # Fetch raw
             muse = await _fetch_muse_all(client)
             print(f"[APIdiscovery] Muse raw: {len(muse)}")
             await asyncio.sleep(2)
@@ -421,9 +481,9 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
             print(f"[APIdiscovery] USAJobs raw: {len(usajobs)}")
 
             all_jobs = muse + remotive + usajobs
-            print(f"[APIdiscovery] Total raw: {len(all_jobs)} — filtering...")
+            print(f"[APIdiscovery] Total raw: {len(all_jobs)}")
 
-            # Hard filter first (cheap — no network calls)
+            # Hard filter (title/location/tech keywords)
             filtered = []
             for job_data in all_jobs:
                 if _passes_hard_filters(
@@ -433,23 +493,33 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
                 ):
                     filtered.append(job_data)
                 else:
-                    rejected_total += 1
+                    hard_rejected += 1
 
-            print(f"[APIdiscovery] After filter: {len(filtered)} kept, "
-                  f"{rejected_total} rejected")
+            print(f"[APIdiscovery] After hard filter: {len(filtered)} kept, "
+                  f"{hard_rejected} rejected")
 
-            # Resolve real ATS URLs for Muse jobs (network calls)
+            # Resolve Muse URLs to real ATS (follows all redirects)
             muse_jobs  = [j for j in filtered if j.get("platform") == "themuse"]
             other_jobs = [j for j in filtered if j.get("platform") != "themuse"]
 
             if muse_jobs:
-                print(f"[APIdiscovery] Resolving ATS URLs for {len(muse_jobs)} Muse jobs...")
-                muse_jobs = await _resolve_batch(muse_jobs, client)
+                print(f"[APIdiscovery] Resolving {len(muse_jobs)} Muse URLs...")
+                muse_jobs = await _resolve_muse_jobs(muse_jobs, client)
+                print(f"[APIdiscovery] {len(muse_jobs)} Muse jobs have automatable ATS")
 
-            filtered = muse_jobs + other_jobs
+            # For non-Muse jobs, filter unautomatable companies
+            other_valid = []
+            for j in other_jobs:
+                if _is_unautomatable_company(j.get("company", "")):
+                    ats_rejected += 1
+                else:
+                    other_valid.append(j)
+
+            final_jobs = muse_jobs + other_valid
+            print(f"[APIdiscovery] Final queue candidates: {len(final_jobs)}")
 
         # Score and add to pool
-        for job_data in filtered:
+        for job_data in final_jobs:
             if stop_event and stop_event.is_set():
                 break
 
@@ -476,13 +546,14 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
 
             if pool.add(job):
                 added_total += 1
-                ats = job.ats_url[:50] if job.ats_url else "?"
-                print(f"[APIdiscovery] ✅ {job.title} @ {job.company} → {ats}")
+                ats_short = (job.ats_url or "")[:55]
+                print(f"[APIdiscovery] ✅ Queued: {job.title} @ {job.company} "
+                      f"→ {ats_short}")
 
         iteration += 1
         print(
-            f"[APIdiscovery] Cycle {iteration}: "
-            f"+{added_total} added, {rejected_total} filtered. "
+            f"[APIdiscovery] Cycle {iteration}: +{added_total} queued, "
+            f"{hard_rejected} hard-filtered, {ats_rejected} unautomatable. "
             f"Pool: {pool.size()}"
         )
 
