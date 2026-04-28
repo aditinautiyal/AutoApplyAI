@@ -4,6 +4,13 @@ One isolated application track. Pulls a job from the pool, researches it,
 generates content, fills the form, submits. Completely isolated per track.
 Uses Playwright with stealth for human-like behavior.
 Paused applications step aside without blocking the track.
+
+Supports:
+- Workday (full account creation + multi-step form)
+- Greenhouse
+- Lever
+- The Muse (click-through to real ATS)
+- Generic ATS fallback
 """
 
 import asyncio
@@ -103,7 +110,7 @@ class TrackWorker:
             # 3. Generate cover letter + humanize
             self._status("writing", f"Writing cover letter for {job.company}...")
             cover_letter = generate_cover_letter(
-                job.title, job.company, job.description, insight
+                job.title, job.company, job.description, insight, app_id
             )
             cover_letter, ai_score, attempts = ensure_humanized(
                 cover_letter, job.company, job.title
@@ -171,10 +178,7 @@ class TrackWorker:
 
     async def _request_approval(self, job: Job, insight: dict,
                                  cover_letter: str, app_id: int) -> tuple[str, str]:
-        """
-        Show approval dialog on main Qt thread and wait for user response.
-        Uses approval_queue for thread-safe communication.
-        """
+        """Show approval dialog on main Qt thread and wait for user response."""
         from ui.approval_queue import request_approval
 
         job_data = {
@@ -198,7 +202,7 @@ class TrackWorker:
                                      cover_letter: str, app_id: int) -> bool:
         """
         Navigate to application URL and fill/submit the form.
-        Handles Greenhouse, Lever, Workday, and generic ATS forms.
+        Routes to the correct handler based on ATS platform detected.
         """
         if not self.page:
             return False
@@ -208,15 +212,62 @@ class TrackWorker:
             await self._delay(2, 4)
 
             profile = self.store.get_profile() or {}
-
-            # Detect platform from URL
             platform = job.platform or ""
             current_url = self.page.url
 
-            if "greenhouse" in current_url or "greenhouse" in platform:
+            # ── Workday ───────────────────────────────────────────────────────
+            from tracks.workday_handler import fill_workday_application, is_workday_url
+            if is_workday_url(current_url) or is_workday_url(url):
+                return await fill_workday_application(
+                    self.page, current_url, job.title, job.company,
+                    insight, cover_letter, app_id
+                )
+
+            # ── Greenhouse ────────────────────────────────────────────────────
+            elif "greenhouse" in current_url or "greenhouse" in platform:
                 return await self._fill_greenhouse(job, insight, cover_letter, profile, app_id)
+
+            # ── Lever ─────────────────────────────────────────────────────────
             elif "lever" in current_url or "lever" in platform:
                 return await self._fill_lever(job, insight, cover_letter, profile, app_id)
+
+            # ── The Muse landing page — click through to real ATS ─────────────
+            elif "themuse.com" in current_url:
+                apply_btn = await self.page.query_selector(
+                    "a[data-automation-id='applyButton'], "
+                    "a:has-text('Apply on Company Site'), "
+                    "a:has-text('Apply Now'), "
+                    "button:has-text('Apply')"
+                )
+                if apply_btn:
+                    try:
+                        async with self.page.expect_navigation(timeout=15000):
+                            await apply_btn.click()
+                    except Exception:
+                        await apply_btn.click()
+                        await asyncio.sleep(3)
+
+                    await self._delay(2, 3)
+                    new_url = self.page.url
+                    print(f"[Track {self.track_id}] Muse → {new_url[:70]}")
+
+                    # Re-detect ATS after redirect
+                    if is_workday_url(new_url):
+                        return await fill_workday_application(
+                            self.page, new_url, job.title, job.company,
+                            insight, cover_letter, app_id
+                        )
+                    elif "greenhouse" in new_url:
+                        return await self._fill_greenhouse(job, insight, cover_letter, profile, app_id)
+                    elif "lever" in new_url:
+                        return await self._fill_lever(job, insight, cover_letter, profile, app_id)
+                    else:
+                        return await self._fill_generic(job, insight, cover_letter, profile, app_id)
+                else:
+                    print(f"[Track {self.track_id}] Muse: no Apply button found on page")
+                    return False
+
+            # ── Generic fallback ──────────────────────────────────────────────
             else:
                 return await self._fill_generic(job, insight, cover_letter, profile, app_id)
 
@@ -233,23 +284,19 @@ class TrackWorker:
                                 profile: dict, app_id: int) -> bool:
         """Fill a Greenhouse ATS application form."""
         try:
-            # Wait for form to load
             await self.page.wait_for_selector("form#application_form, #application-form", timeout=10000)
             await self._delay(1, 2)
 
-            # Fill standard fields
             await self._fill_field_by_id("first_name", profile.get("full_name", "").split()[0] if profile.get("full_name") else "")
             await self._fill_field_by_id("last_name", profile.get("full_name", "").split()[-1] if profile.get("full_name") else "")
             await self._fill_field_by_id("email", profile.get("email", ""))
             await self._fill_field_by_id("phone", profile.get("phone", ""))
 
-            # Cover letter / resume text areas
             cover_area = await self.page.query_selector("textarea[name*='cover'], textarea[id*='cover']")
             if cover_area:
                 await cover_area.fill(cover_letter)
                 await self._delay(0.5, 1)
 
-            # Resume upload
             resume_input = await self.page.query_selector("input[type='file'][name*='resume']")
             if resume_input and profile.get("resume_path"):
                 try:
@@ -258,10 +305,8 @@ class TrackWorker:
                 except Exception:
                     pass
 
-            # Answer custom questions
             await self._fill_custom_questions(job, insight, cover_letter, profile)
 
-            # Submit
             submit_btn = await self.page.query_selector(
                 "input[type='submit'], button[type='submit'], button:has-text('Submit Application')"
             )
@@ -283,12 +328,10 @@ class TrackWorker:
             await self.page.wait_for_selector(".application-form, form", timeout=10000)
             await self._delay(1, 2)
 
-            # Lever field selectors
             await self._fill_field_by_placeholder("Full name", profile.get("full_name", ""))
             await self._fill_field_by_placeholder("Email", profile.get("email", ""))
             await self._fill_field_by_placeholder("Phone", profile.get("phone", ""))
 
-            # LinkedIn/Portfolio
             linkedin = profile.get("linkedin_url", "")
             if linkedin:
                 await self._fill_field_by_placeholder("LinkedIn", linkedin)
@@ -297,7 +340,6 @@ class TrackWorker:
             if portfolio:
                 await self._fill_field_by_placeholder("Website", portfolio)
 
-            # Cover letter
             cover_area = await self.page.query_selector(
                 "textarea[placeholder*='cover'], textarea[data-field='comments']"
             )
@@ -305,7 +347,6 @@ class TrackWorker:
                 await cover_area.fill(cover_letter)
                 await self._delay(0.5, 1)
 
-            # Resume upload
             resume_input = await self.page.query_selector("input[type='file']")
             if resume_input and profile.get("resume_path"):
                 try:
@@ -314,7 +355,6 @@ class TrackWorker:
                 except Exception:
                     pass
 
-            # Submit
             submit_btn = await self.page.query_selector(
                 "button[type='submit'], button:has-text('Submit Application'), button:has-text('Apply')"
             )
@@ -323,7 +363,6 @@ class TrackWorker:
                 await submit_btn.click()
                 await self._delay(3, 5)
 
-                # Check for confirmation
                 confirm = await self.page.query_selector(
                     ".success-message, h2:has-text('Application received'), h1:has-text('Thank you')"
                 )
@@ -338,9 +377,9 @@ class TrackWorker:
                              profile: dict, app_id: int) -> bool:
         """Fill a generic / unknown ATS form using heuristic field mapping."""
         try:
-            # Fill all visible text inputs using label/placeholder matching
             inputs = await self.page.query_selector_all(
-                "input:not([type='hidden']):not([type='submit']):not([type='file']):not([type='checkbox']):not([type='radio']),"
+                "input:not([type='hidden']):not([type='submit']):not([type='file'])"
+                ":not([type='checkbox']):not([type='radio']),"
                 "textarea"
             )
 
@@ -358,7 +397,6 @@ class TrackWorker:
                 except Exception:
                     continue
 
-            # Resume upload
             file_input = await self.page.query_selector("input[type='file']")
             if file_input and profile.get("resume_path"):
                 try:
@@ -367,7 +405,6 @@ class TrackWorker:
                 except Exception:
                     pass
 
-            # Submit
             submit_btn = await self.page.query_selector(
                 "input[type='submit'], button[type='submit'],"
                 "button:has-text('Submit'), button:has-text('Apply')"
@@ -387,19 +424,17 @@ class TrackWorker:
                                       cover_letter: str, profile: dict):
         """Find and answer custom application questions using AI."""
         try:
-            # Find question labels + their associated inputs
             question_selectors = [
                 "label:not([for*='resume']):not([for*='name']):not([for*='email']):not([for*='phone'])",
             ]
             for selector in question_selectors:
                 labels = await self.page.query_selector_all(selector)
-                for label_el in labels[:10]:  # Max 10 custom questions
+                for label_el in labels[:10]:
                     try:
                         question_text = await label_el.inner_text()
                         if len(question_text.strip()) < 10:
                             continue
 
-                        # Find the associated input
                         label_for = await label_el.get_attribute("for")
                         if label_for:
                             inp = await self.page.query_selector(f"#{label_for}, [name='{label_for}']")
@@ -415,7 +450,6 @@ class TrackWorker:
                         if tag not in ("input", "textarea", "select"):
                             continue
 
-                        # Generate answer
                         answer = generate_form_answer(
                             question_text, job.title, job.company, insight
                         )
@@ -436,12 +470,8 @@ class TrackWorker:
 
     async def _post_submission_actions(self, app_id: int, job: Job,
                                         insight: dict, cover_letter: str):
-        """
-        Background tasks after submission — don't block next application.
-        Find contacts, send cold email.
-        """
+        """Background tasks after submission."""
         try:
-            # Find people to contact at this company
             from extra_effort.people_finder import find_contacts_for_application
             contacts = await find_contacts_for_application(
                 job.company, job.title, app_id, insight
@@ -452,7 +482,6 @@ class TrackWorker:
             print(f"[Track {self.track_id}] People finder error: {e}")
 
         try:
-            # Send cold email if Gmail connected
             from email_handler.gmail_sender import send_cold_email_for_application
             send_cold_email_for_application(app_id, job.company, job.title, insight)
         except Exception as e:
@@ -485,7 +514,6 @@ class TrackWorker:
             pass
 
     async def _get_label_text(self, field_el) -> str:
-        """Get the label text for a form field."""
         try:
             field_id = await field_el.get_attribute("id")
             if field_id:
@@ -500,7 +528,6 @@ class TrackWorker:
 
     def _map_field_value(self, field_name: str, profile: dict,
                           cover_letter: str, insight: dict) -> str:
-        """Map a field name/placeholder to the correct profile value."""
         full_name = profile.get("full_name", "") or ""
         mapping = {
             "first":      full_name.split()[0] if full_name else "",
@@ -525,22 +552,18 @@ class TrackWorker:
             if key in field_name and value:
                 return str(value)
 
-        # Check learned answers DB
         stored = self.store.find_learned_answer(field_name)
         return stored or ""
 
     async def _type_human(self, element, text: str):
-        """Type with human-like speed variation."""
         try:
             await element.click()
-            # Fast autofill for personal info, slower for text areas
             for char in text:
                 delay = random.randint(MIN_KEYSTROKE_MS, MAX_KEYSTROKE_MS)
                 await element.type(char, delay=delay)
-                if random.random() < 0.03:  # Occasional pause
+                if random.random() < 0.03:
                     await asyncio.sleep(random.uniform(0.1, 0.4))
         except Exception:
-            # Fallback to fill() if type() fails
             try:
                 await element.fill(text)
             except Exception:
@@ -552,13 +575,12 @@ class TrackWorker:
     # ── Browser lifecycle ──────────────────────────────────────────────────────
 
     async def _init_browser(self):
-        """Initialize Playwright browser for this track."""
         try:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
             self.context = await self._playwright.chromium.launch_persistent_context(
                 user_data_dir=f"/tmp/autoapplyai_track_{self.track_id}",
-                headless=True,  # Fast tracks run headless
+                headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -566,7 +588,6 @@ class TrackWorker:
                 ],
             )
             self.page = await self.context.new_page()
-            # Set realistic viewport and user agent
             await self.page.set_viewport_size({"width": 1280, "height": 800})
             print(f"[Track {self.track_id}] Browser initialized")
         except Exception as e:
@@ -574,7 +595,6 @@ class TrackWorker:
             self.page = None
 
     async def _close_browser(self):
-        """Clean up browser resources."""
         try:
             if self.context:
                 await self.context.close()

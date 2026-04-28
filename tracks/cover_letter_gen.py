@@ -1,8 +1,12 @@
 """
 tracks/cover_letter_gen.py
 Generates tailored cover letters using company research + user profile.
-Integrates advice DB — pulls top-ranked tips into every generation.
-Uses Claude Sonnet (smart) for cover letters, Haiku for form answers.
+
+KEY FIX: generate_cover_letter() ALWAYS produces a real cover letter,
+never a refusal or analysis. If the job is a poor fit, it still writes
+the best possible cover letter AND creates a separate inbox notification
+flagging the concern — so the user sees the warning without the cover
+letter being corrupted.
 """
 
 import json
@@ -96,20 +100,8 @@ def _build_insight_context(insight: dict) -> str:
 
 
 def _get_banned_project_names() -> list[str]:
-    """
-    Returns project names that must never appear in cover letters.
-    AutoApplyAI and any variant should never be mentioned — recruiters
-    seeing it would assume the application is bot-generated.
-    """
     store = get_store()
-    # Core ban list — always enforced
-    banned = [
-        "AutoApplyAI",
-        "Auto Apply AI",
-        "AutoApply",
-        "auto apply",
-    ]
-    # Also pull any user-defined banned terms from settings
+    banned = ["AutoApplyAI", "Auto Apply AI", "AutoApply", "auto apply"]
     extra = store.get("cover_letter_banned_terms", [])
     if isinstance(extra, str):
         try:
@@ -120,51 +112,101 @@ def _get_banned_project_names() -> list[str]:
     return banned
 
 
+def _is_refusal(text: str) -> bool:
+    """
+    Detects if the AI wrote a refusal/analysis instead of a cover letter.
+    Returns True if the text looks like a refusal, False if it's a real CL.
+    """
+    refusal_signals = [
+        "i recommend", "would not serve", "cannot bridge", "i'm happy to write",
+        "i'd be happy to write", "applying could reflect poorly",
+        "gap that", "my recommendation", "none of these appear",
+        "would likely damage", "hiring teams for", "cover letter cannot",
+        "writing a cover letter for this", "applying would",
+        "i suggest skipping", "i would advise against",
+        "this role isn't", "this isn't a good fit",
+        "the profile doesn't", "aditi's profile",
+    ]
+    text_lower = text.lower()
+    return any(signal in text_lower for signal in refusal_signals)
+
+
+def _flag_poor_fit(job_title: str, company: str, concern: str, app_id: int = None):
+    """
+    Creates an inbox notification flagging a poor fit concern.
+    Completely separate from the cover letter — doesn't interfere with it.
+    """
+    try:
+        store = get_store()
+        store.add_notification(
+            notif_type="clarification",
+            title=f"⚠️ Fit concern flagged: {job_title} @ {company}",
+            message=(
+                f"AutoApplyAI applied to this role but flagged a potential fit concern:\n\n"
+                f"{concern}\n\n"
+                f"The cover letter was still written and submitted. "
+                f"Review if you'd like to follow up or withdraw."
+            ),
+            application_id=app_id,
+        )
+    except Exception:
+        pass
+
+
 def generate_cover_letter(
     job_title: str,
     company: str,
     job_description: str,
     insight: dict,
+    app_id: int = None,
 ) -> str:
     """
-    Generate a tailored cover letter.
-    Integrates: user profile + company research + proven advice from DB.
-    Uses Sonnet (smart=True) — quality matters here.
+    ALWAYS generates a real cover letter. Never writes a refusal.
+
+    If the job seems like a poor fit, it:
+    1. Still writes the best possible cover letter
+    2. Creates a separate inbox notification flagging the concern
+    3. Returns the cover letter unchanged
+
+    This means the approval dialog always shows a real cover letter,
+    and fit concerns appear in the Inbox tab separately.
     """
     router = get_router()
-    store = get_store()
+    store  = get_store()
     profile = store.get_profile() or {}
 
-    user_context = _build_user_context(store, profile)
+    user_context    = _build_user_context(store, profile)
     insight_context = _build_insight_context(insight)
-    advice_context = _get_advice_context("cover_letter")
-    banned_names = _get_banned_project_names()
+    advice_context  = _get_advice_context("cover_letter")
+    banned_names    = _get_banned_project_names()
 
-    # Build the banned terms instruction string
     banned_instruction = (
-        "- NEVER mention any of these project names under any circumstances, "
-        "even as examples of automation or AI work: "
+        "NEVER mention any of these project names: "
         + ", ".join(f'"{b}"' for b in banned_names)
         + ". If referencing automation projects, describe the technical skills "
-        "involved (e.g. 'built an async Python automation pipeline') without naming "
-        "the project itself."
+        "involved without naming the project itself."
     )
 
-    # Pull any custom instructions the user has set via AI Chat
     custom_instructions = store.get("cover_letter_custom_instructions", "")
 
-    system = f"""You are an expert job application writer. Write cover letters that:
-- Sound like a real, thoughtful person wrote them — not AI-generated
-- Are specific to this exact company and role — not generic
-- Demonstrate genuine research into company culture and values
-- Use natural, confident professional language with varied sentence length
-- Are 3-4 paragraphs, 250-350 words maximum
-- Never start with "I am writing to express my interest" or similar
-- Start with something specific and engaging about the company or role
-- End with confident, forward-looking next steps
-- Incorporate proven best practices naturally, not mechanically
-{banned_instruction}
-{"Additional instructions: " + custom_instructions if custom_instructions else ""}"""
+    system = f"""You are an expert job application cover letter writer.
+
+CRITICAL RULES — these override everything else:
+1. ALWAYS write a real, complete cover letter. NEVER write analysis, recommendations,
+   explanations, or refusals. Even if the fit seems imperfect, write the best
+   cover letter you can using whatever overlap exists.
+2. Start directly with the cover letter content — no preamble like "Here is a cover letter"
+3. Do NOT start with "I am writing to express my interest" or similar
+4. Do NOT use buzzwords: "passion", "leverage", "synergy", "dynamic", "innovative"
+5. 3-4 paragraphs, 250-350 words maximum
+6. End with confident, forward-looking next steps
+7. {banned_instruction}
+{"8. Additional instructions: " + custom_instructions if custom_instructions else ""}
+
+If the fit is imperfect, find ANY genuine connection between the applicant's
+background and the role — transferable skills, adjacent experience, relevant
+coursework, genuine interest — and build the letter around that. A real letter
+that is a stretch is always better than a refusal."""
 
     prompt = f"""Write a cover letter for this application.
 
@@ -179,25 +221,77 @@ Description: {job_description[:600]}
 COMPANY RESEARCH & STRATEGY:
 {insight_context}
 
-PROVEN ADVICE TO APPLY (weave in naturally):
+PROVEN ADVICE TO APPLY:
 {advice_context}
 
-INSTRUCTIONS:
-- Reference the company's actual personality and values naturally
-- Connect specific experiences from the applicant's background to what this company needs
-- If there's a unique insight, weave it in to show depth of research
-- Sound enthusiastic but grounded — real, not performative
-- Do NOT start with "I am writing to apply"
-- Do NOT use buzzwords: "passion", "leverage", "synergy", "dynamic", "innovative"
-- Keywords should appear naturally in sentences, not listed
-- Apply the proven advice but keep it feeling authentic
-- Write the full cover letter only — no subject line, no [placeholders]
-- {banned_instruction}"""
+Write the complete cover letter now. Start with the first line of the letter itself.
+{banned_instruction}"""
 
     cover_letter = router.complete(
         prompt, system=system, smart=True, max_tokens=700
-    )
-    return cover_letter.strip()
+    ).strip()
+
+    # Safety check — if it still wrote a refusal, force-regenerate with stricter prompt
+    if _is_refusal(cover_letter):
+        print(f"[CoverLetter] Refusal detected for {company} — force regenerating...")
+
+        # Flag the fit concern in inbox
+        _flag_poor_fit(
+            job_title, company,
+            "AutoApplyAI initially flagged this as a potential poor fit. "
+            "Review the cover letter and role before any follow-up.",
+            app_id
+        )
+
+        # Force regenerate with an even more explicit prompt
+        force_prompt = f"""Write a cover letter from {profile.get('full_name', 'the applicant')}
+to {company} for the {job_title} role.
+
+The applicant has a computer science and AI/ML background.
+Find any connection between their technical background and this role.
+Focus on transferable skills: problem-solving, technical thinking, learning ability,
+building systems, data analysis, or any relevant coursework.
+
+Write 3 paragraphs, 200-250 words. Start with the first sentence of the letter.
+Do not explain, analyze, or refuse. Just write the letter.
+
+Applicant background summary:
+{(profile.get('background_text') or '')[:400]}
+
+Role: {job_title} at {company}"""
+
+        cover_letter = router.complete(
+            force_prompt, system="You write cover letters. Always produce a letter, never a refusal.",
+            smart=False, max_tokens=500
+        ).strip()
+
+    # Final safety — if STILL a refusal after two attempts, use a solid template
+    if _is_refusal(cover_letter):
+        name = profile.get("full_name", "")
+        cover_letter = (
+            f"I'm excited to apply for the {job_title} role at {company}. "
+            f"As a Computer Science student at Purdue University with hands-on "
+            f"experience building AI-powered systems and autonomous pipelines, "
+            f"I bring a strong technical foundation and a track record of shipping "
+            f"real software independently.\n\n"
+            f"My work building production-grade async Python systems, integrating "
+            f"large language model APIs, and designing encrypted data persistence "
+            f"layers has given me deep experience with the kind of engineering "
+            f"challenges that matter in fast-moving technical environments. "
+            f"I'm drawn to {company} because of the opportunity to apply these "
+            f"skills at scale alongside people who take technical craft seriously.\n\n"
+            f"I'd welcome the chance to discuss how my background fits the "
+            f"{job_title} role. Thank you for your consideration."
+        )
+        # Flag this too
+        _flag_poor_fit(
+            job_title, company,
+            "Cover letter fell back to template — the role may be a significant stretch. "
+            "Review before any follow-up.",
+            app_id
+        )
+
+    return cover_letter
 
 
 def generate_form_answer(
@@ -210,6 +304,7 @@ def generate_form_answer(
     """
     Generate an answer to a specific application form question.
     Checks learned_answers first. Falls back to Haiku generation.
+    Always returns a real answer — never a refusal.
     """
     store = get_store()
     banned_names = _get_banned_project_names()
@@ -258,6 +353,7 @@ Return only the adapted answer:"""
             vals = []
 
     prompt = f"""Answer this application question for the candidate.
+Always write a real, direct answer — never refuse or explain why you can't answer.
 
 Question: {question}
 
@@ -272,8 +368,7 @@ Rules:
 - {max_words} words or fewer
 - Natural, human — not corporate AI speak
 - Specific, not generic
-- Relate to company values where relevant
-- Answer ONLY — no preamble like "Here is my answer:"
+- Answer ONLY — no preamble
 - {banned_instruction}
 
 Answer:"""
@@ -295,12 +390,9 @@ def generate_cold_email_body(
     insight: dict,
     recipient_name: str = "",
 ) -> tuple[str, str]:
-    """
-    Generate subject + body for a cold outreach email.
-    Returns (subject, body).
-    """
+    """Generate subject + body for cold outreach. Returns (subject, body)."""
     router = get_router()
-    store = get_store()
+    store  = get_store()
     profile = store.get_profile() or {}
     banned_names = _get_banned_project_names()
     banned_instruction = (
@@ -308,11 +400,11 @@ def generate_cold_email_body(
         + ", ".join(f'"{b}"' for b in banned_names) + "."
     )
 
-    name = profile.get("full_name", "")
+    name       = profile.get("full_name", "")
     background = (profile.get("background_text") or "")[:250]
-    strengths = (profile.get("strengths_text") or "")[:150]
-    portfolio = profile.get("portfolio_url", "")
-    linkedin = profile.get("linkedin_url", "")
+    strengths  = (profile.get("strengths_text") or "")[:150]
+    portfolio  = profile.get("portfolio_url", "")
+    linkedin   = profile.get("linkedin_url", "")
 
     vals = insight.get("core_values", [])
     if isinstance(vals, str):
@@ -321,40 +413,33 @@ def generate_cold_email_body(
         except Exception:
             vals = []
 
-    tone = insight.get("tone", "professional")
+    tone           = insight.get("tone", "professional")
     unique_insight = insight.get("unique_insight", "")
-    cold_email_advice = _get_advice_context("cold_email")
+    cold_advice    = _get_advice_context("cold_email")
     greeting = f"Hi {recipient_name.split()[0]}," if recipient_name else "Hi there,"
 
-    system = f"""You write highly effective cold outreach emails for job applications.
-Keep them: brief (150-200 words), specific to the company, professional,
-and end with a clear single ask. Never use generic openers.
-{banned_instruction}"""
+    system = f"""You write concise cold outreach emails for job applications.
+Keep them under 200 words, specific to the company, professional.
+ALWAYS write the email — never refuse. {banned_instruction}"""
 
-    body_prompt = f"""Write a cold email from {name} to a recruiter at {company} about the {job_title} role.
+    body_prompt = f"""Write a cold email from {name} to a recruiter at {company}
+about the {job_title} role.
 
 Background: {background}
 Strengths: {strengths}
 Portfolio: {portfolio}
 LinkedIn: {linkedin}
-
-Company: {insight.get('personality', '')}
-They value: {', '.join(vals[:3]) if vals else 'excellence'}
-Tone: {tone}
+Company tone: {tone}
 Unique angle: {unique_insight}
 
-Proven cold email tips to apply naturally:
-{cold_email_advice}
-
 Start with: {greeting}
-Body only, no subject. Under 200 words. Genuine and specific.
-{banned_instruction}"""
+Under 200 words. Genuine and specific. {banned_instruction}"""
 
     body = router.complete(body_prompt, system=system, smart=False, max_tokens=400).strip()
 
     subject_prompt = f"""One-line email subject for cold outreach from {name}
 about the {job_title} role at {company}.
-Under 55 characters. Specific and compelling. Return ONLY the subject text."""
+Under 55 characters. Return ONLY the subject text."""
 
     subject = router.complete(subject_prompt, max_tokens=25).strip().strip('"\'')
 
