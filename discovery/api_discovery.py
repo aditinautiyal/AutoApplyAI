@@ -973,7 +973,7 @@ async def run_api_discovery(continuous: bool = True, stop_event=None):
             simplyhired = await _fetch_simplyhired(client)
             dice       = await _fetch_dice(client)
             internships = await _fetch_internships_com(client)
-            linkedin   = await _fetch_linkedin_public(client)
+            linkedin   = []
             muse       = await _fetch_muse(client)
 
         all_jobs = (
