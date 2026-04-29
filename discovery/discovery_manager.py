@@ -1,8 +1,13 @@
 """
 discovery/discovery_manager.py
 Runs all discovery sources in parallel background coroutines.
-Uses API-based discovery (no scraping, no rate limits) as primary source.
-Google ATS search kept as secondary, rate-limited to 30 min cycles.
+
+Sources:
+1. API discovery (SimplyHired, Remotive, USAJobs, Muse) — every 20 min
+2. Playwright scraper (Built In, Wellfound, YC, Internships.com) — every 30 min
+3. Google ATS search — when VPN enabled, every 30 min
+4. Deep web scan (HN, YC API) — every 45 min
+5. Advice scraper — once at startup
 """
 
 import asyncio
@@ -61,20 +66,29 @@ class DiscoveryManager:
 
         tasks = []
 
-        # ── PRIMARY: API-based discovery (no scraping, never rate-limited) ──
-        # Replaces RSS feeds, Reddit, and Google as the main source.
-        # The Muse + Remotive + Jobicy + Arbeitnow + USAJobs.
+        # ── 1. API discovery — SimplyHired, Remotive, USAJobs, Muse ──────────
         try:
             from discovery.api_discovery import run_api_discovery
             tasks.append(asyncio.create_task(
                 run_api_discovery(continuous=True, stop_event=self._stop_event),
                 name="APIDiscovery"
             ))
-            print("[Discovery] API discovery started (The Muse, Remotive, Jobicy, Arbeitnow)")
+            print("[Discovery] API discovery started (SimplyHired, Remotive, USAJobs, Muse)")
         except Exception as e:
             print(f"[Discovery] Could not start API discovery: {e}")
 
-        # ── SECONDARY: Advice scraping (always runs once at startup) ──
+        # ── 2. Playwright scraper — Built In, Wellfound, YC, Internships ──────
+        try:
+            from discovery.playwright_scraper import run_playwright_scraping
+            tasks.append(asyncio.create_task(
+                run_playwright_scraping(continuous=True, stop_event=self._stop_event),
+                name="PlaywrightScraper"
+            ))
+            print("[Discovery] Playwright scraper started (Built In, Wellfound, YC)")
+        except Exception as e:
+            print(f"[Discovery] Could not start Playwright scraper: {e}")
+
+        # ── 3. Advice scraping — once at startup ──────────────────────────────
         try:
             from research.advice_scraper import run_advice_scraping
             tasks.append(asyncio.create_task(
@@ -84,43 +98,28 @@ class DiscoveryManager:
         except Exception as e:
             print(f"[Discovery] Could not start advice scraper: {e}")
 
-        # ── OPTIONAL: Google ATS search (only if enabled, rate-limited) ──
-        # Only runs if explicitly enabled. Hits once per 30 min max.
-        if enabled_platforms and "Google ATS Deep Search" in enabled_platforms:
+        # ── 4. Google ATS search — when VPN enabled ───────────────────────────
+        if not enabled_platforms or "Google ATS Deep Search" in enabled_platforms:
             try:
                 from discovery.google_search import run_google_discovery
                 tasks.append(asyncio.create_task(
                     run_google_discovery(continuous=True, stop_event=self._stop_event),
                     name="GoogleSearch"
                 ))
-                print("[Discovery] Google ATS search enabled (30 min cycles)")
+                print("[Discovery] Google ATS search enabled (use VPN, 30 min cycles)")
             except Exception as e:
                 print(f"[Discovery] Could not start Google search: {e}")
 
-        # ── OPTIONAL: Deep web scan (YC, HN — only if enabled) ──
-        if enabled_platforms and ("Deep Web Scan" in enabled_platforms or
-                                   "Startup Boards" in enabled_platforms):
+        # ── 5. Deep web scan — HN, YC API ─────────────────────────────────────
+        if not enabled_platforms or "Deep Web Scan" in enabled_platforms:
             try:
                 from discovery.deep_web_scanner import run_deep_web_discovery
                 tasks.append(asyncio.create_task(
                     run_deep_web_discovery(continuous=True, stop_event=self._stop_event),
                     name="DeepWebScan"
                 ))
-            except ImportError as e:
-                print(f"[Discovery] Deep web scanner unavailable: {e} — skipping")
             except Exception as e:
-                print(f"[Discovery] Could not start deep web scanner: {e}")
-
-        # ── LEGACY: RSS feeds (kept for USAJobs which RSS works for) ──
-        if not enabled_platforms or "USAJobs Feed" in enabled_platforms:
-            try:
-                from discovery.rss_feeds import run_rss_discovery
-                tasks.append(asyncio.create_task(
-                    run_rss_discovery(continuous=True, stop_event=self._stop_event),
-                    name="RSSFeeds"
-                ))
-            except Exception as e:
-                print(f"[Discovery] Could not start RSS feeds: {e}")
+                print(f"[Discovery] Deep web scanner: {e}")
 
         if not tasks:
             print("[Discovery] Warning: no discovery sources started")

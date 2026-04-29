@@ -18,6 +18,7 @@ import random
 import re
 import time
 import threading
+import pathlib
 from typing import Optional, Callable
 from discovery.job_pool import get_pool, Job
 from research.company_researcher import research_company
@@ -109,6 +110,13 @@ class TrackWorker:
         await self._init_browser()
 
         while not self.stop_event.is_set():
+        # Reinitialize browser if it died
+            if not self.page or self.page.is_closed():
+                print(f"[Track {self.track_id}] Browser died — reinitializing...")
+                await self._close_browser()
+                await asyncio.sleep(3)
+                await self._init_browser()
+
             job = self.pool.get_next()
             if not job:
                 self._status("idle", "Waiting for jobs...")
@@ -125,7 +133,14 @@ class TrackWorker:
                 print(f"[Track {self.track_id}] Error: {e}")
                 self.pool.mark_done(job.job_id, "failed")
                 self._status("error", str(e)[:80])
-                await asyncio.sleep(3)
+                # If browser-related error, reinitialize
+                if any(kw in str(e).lower() for kw in
+                        ["closed", "disconnected", "crashed", "target"]):
+                    await self._close_browser()
+                    await asyncio.sleep(3)
+                    await self._init_browser()
+                else:
+                    await asyncio.sleep(3)
 
         await self._close_browser()
 
@@ -1133,7 +1148,7 @@ class TrackWorker:
             from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
             self.context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=f"/tmp/autoapplyai_track_{self.track_id}",
+                user_data_dir=str(pathlib.Path.home() / ".autoapplyai" / f"track_{self.track_id}"),
                 headless=False,  # MUST be False — JS doesn't render headless
                 args=[
                     "--disable-blink-features=AutomationControlled",
