@@ -65,7 +65,10 @@ class JobPool:
 
     def _load_seen_urls(self):
         apps = self.store.get_applications()
-        self._seen_urls = {a["job_url"] for a in apps if a.get("job_url")}
+        self._seen_urls = {
+            a["job_url"] for a in apps
+            if a.get("job_url") and a.get("status") == "submitted"
+    }
 
     def add(self, job: Job) -> bool:
         url = job.ats_url or job.url
