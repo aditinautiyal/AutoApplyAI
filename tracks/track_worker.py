@@ -231,27 +231,74 @@ class TrackWorker:
             elif "lever" in current_url or "lever" in platform:
                 return await self._fill_lever(job, insight, cover_letter, profile, app_id)
 
-            # ── The Muse landing page — click through to real ATS ─────────────
-            elif "themuse.com" in current_url:
-                apply_btn = await self.page.query_selector(
-                    "a[data-automation-id='applyButton'], "
-                    "a:has-text('Apply on Company Site'), "
-                    "a:has-text('Apply Now'), "
-                    "button:has-text('Apply')"
-                )
-                if apply_btn:
+            # ── Aggregator pages — click through to real ATS ──────────────────
+            # SimplyHired, Dice, LinkedIn public, The Muse, and other job boards
+            # show listings but require clicking Apply to reach the real ATS form.
+            elif any(agg in current_url for agg in [
+                "themuse.com", "simplyhired.com", "dice.com",
+                "linkedin.com/jobs", "internships.com", "wellfound.com",
+                "workatastartup.com", "builtinchicago.org", "builtindallas.com",
+                "builtin.com", "builtinnyc.com", "builtinaustin.com",
+                "builtinseattle.com", "builtinboston.com",
+            ]):
+                # Try all known Apply button patterns across aggregators
+                apply_btn = None
+                apply_selectors = [
+                    # SimplyHired
+                    "a[data-testid='viewJobButton']",
+                    "a[class*='applyButton']",
+                    "button[class*='applyButton']",
+                    # LinkedIn
+                    "a[class*='apply-button']",
+                    "button[class*='apply-button']",
+                    ".jobs-apply-button",
+                    # Built In
+                    "a[class*='apply']",
+                    "button[class*='apply']",
+                    # The Muse
+                    "a[data-automation-id='applyButton']",
+                    # Generic apply patterns (try last)
+                    "a:has-text('Apply on Company Site')",
+                    "a:has-text('Apply Now')",
+                    "a:has-text('Apply for this job')",
+                    "button:has-text('Apply Now')",
+                    "button:has-text('Apply for Job')",
+                    "a[href*='apply']:not([href*='simplyhired']):not([href*='linkedin']):not([href*='dice'])",
+                ]
+
+                for sel in apply_selectors:
                     try:
-                        async with self.page.expect_navigation(timeout=15000):
-                            await apply_btn.click()
+                        btn = await self.page.query_selector(sel)
+                        if btn and await btn.is_visible():
+                            apply_btn = btn
+                            break
                     except Exception:
-                        await apply_btn.click()
-                        await asyncio.sleep(3)
+                        continue
+
+                if apply_btn:
+                    # Get the href before clicking in case it's a direct link
+                    href = await apply_btn.get_attribute("href") or ""
+                    print(f"[Track {self.track_id}] Aggregator Apply button found → {href[:60]}")
+
+                    try:
+                        # Open in same tab
+                        if href and href.startswith("http"):
+                            await self.page.goto(href, wait_until="networkidle", timeout=20000)
+                        else:
+                            async with self.page.expect_navigation(timeout=15000):
+                                await apply_btn.click()
+                    except Exception:
+                        try:
+                            await apply_btn.click()
+                            await asyncio.sleep(4)
+                        except Exception:
+                            pass
 
                     await self._delay(2, 3)
                     new_url = self.page.url
-                    print(f"[Track {self.track_id}] Muse → {new_url[:70]}")
+                    print(f"[Track {self.track_id}] → Landed on: {new_url[:70]}")
 
-                    # Re-detect ATS after redirect
+                    # Route to correct ATS handler
                     if is_workday_url(new_url):
                         return await fill_workday_application(
                             self.page, new_url, job.title, job.company,
@@ -261,10 +308,14 @@ class TrackWorker:
                         return await self._fill_greenhouse(job, insight, cover_letter, profile, app_id)
                     elif "lever" in new_url:
                         return await self._fill_lever(job, insight, cover_letter, profile, app_id)
+                    elif new_url == current_url:
+                        # Didn't navigate — probably opened new tab or failed
+                        print(f"[Track {self.track_id}] No navigation after click — skipping")
+                        return False
                     else:
                         return await self._fill_generic(job, insight, cover_letter, profile, app_id)
                 else:
-                    print(f"[Track {self.track_id}] Muse: no Apply button found on page")
+                    print(f"[Track {self.track_id}] No Apply button found on aggregator page")
                     return False
 
             # ── Generic fallback ──────────────────────────────────────────────
