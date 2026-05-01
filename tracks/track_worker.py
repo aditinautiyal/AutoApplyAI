@@ -14,11 +14,11 @@ Key improvements:
 """
 
 import asyncio
+import pathlib
 import random
 import re
 import time
 import threading
-import pathlib
 from typing import Optional, Callable
 from discovery.job_pool import get_pool, Job
 from research.company_researcher import research_company
@@ -110,9 +110,9 @@ class TrackWorker:
         await self._init_browser()
 
         while not self.stop_event.is_set():
-        # Reinitialize browser if it died
+            # Reinitialize browser if it crashed
             if not self.page or self.page.is_closed():
-                print(f"[Track {self.track_id}] Browser died — reinitializing...")
+                print(f"[Track {self.track_id}] Browser crashed — restarting...")
                 await self._close_browser()
                 await asyncio.sleep(3)
                 await self._init_browser()
@@ -133,14 +133,7 @@ class TrackWorker:
                 print(f"[Track {self.track_id}] Error: {e}")
                 self.pool.mark_done(job.job_id, "failed")
                 self._status("error", str(e)[:80])
-                # If browser-related error, reinitialize
-                if any(kw in str(e).lower() for kw in
-                        ["closed", "disconnected", "crashed", "target"]):
-                    await self._close_browser()
-                    await asyncio.sleep(3)
-                    await self._init_browser()
-                else:
-                    await asyncio.sleep(3)
+                await asyncio.sleep(3)
 
         await self._close_browser()
 
@@ -249,6 +242,9 @@ class TrackWorker:
         ats_type    = _detect_ats(current_url)
 
         print(f"[Track {self.track_id}] URL: {current_url[:70]} → ATS: {ats_type}")
+
+        # Dismiss any cookie/popup banners on every page load
+        await self._dismiss_popups()
 
         # If we landed on an aggregator, click through to the real ATS
         if ats_type == "aggregator":
@@ -402,57 +398,231 @@ class TrackWorker:
         else:
             return await self._fill_generic_ats(job, insight, cover_letter, profile, app_id)
 
+    # ─── Popup/Cookie dismisser ───────────────────────────────────────────────
+
+    async def _dismiss_popups(self):
+        """Dismiss cookie banners, consent popups, and overlays."""
+        cookie_selectors = [
+            "button:has-text('Accept all')", "button:has-text('Accept All')",
+            "button:has-text('Accept cookies')", "button:has-text('Accept Cookies')",
+            "button:has-text('I Accept')", "button:has-text('I agree')",
+            "button:has-text('Agree')", "button:has-text('Allow all')",
+            "button:has-text('Allow All')", "button:has-text('Got it')",
+            "button:has-text('Got It')", "button:has-text('Dismiss')",
+            "#onetrust-accept-btn-handler", "#accept-cookies", "#cookie-accept",
+            ".cookie-accept", "[data-testid='cookie-accept']",
+            "[aria-label='Accept cookies']",
+        ]
+        for sel in cookie_selectors:
+            try:
+                btn = await self.page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await self._delay(0.5, 1)
+                    print(f"[Track {self.track_id}] Dismissed popup")
+                    break
+            except Exception:
+                continue
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    # ─── Smart dropdown selector ───────────────────────────────────────────────
+
+    async def _select_dropdown(self, selector: str, value: str) -> bool:
+        """Robustly select from <select> or custom dropdown."""
+        try:
+            el = await self.page.query_selector(selector)
+            if not el:
+                return False
+            tag = (await el.evaluate("el => el.tagName")).lower()
+            if tag == "select":
+                # Try exact label
+                try:
+                    await el.select_option(label=value)
+                    return True
+                except Exception:
+                    pass
+                # Try value
+                try:
+                    await el.select_option(value=value)
+                    return True
+                except Exception:
+                    pass
+                # Try fuzzy match
+                options = await el.evaluate(
+                    "el => Array.from(el.options).map(o => ({v:o.value, t:o.text.trim()}))"
+                )
+                vl = value.lower()
+                for opt in options:
+                    if vl in opt["t"].lower() or opt["t"].lower() in vl:
+                        await el.select_option(value=opt["v"])
+                        return True
+                # Last resort: pick index 1
+                if len(options) > 1:
+                    await el.select_option(index=1)
+                    return True
+            else:
+                await el.click()
+                await self._delay(0.5, 1)
+                for opt_sel in [
+                    f"[role='option']:has-text('{value}')",
+                    f"li:has-text('{value}')",
+                    f"div[class*='option']:has-text('{value}')",
+                ]:
+                    opt = await self.page.query_selector(opt_sel)
+                    if opt:
+                        await opt.click()
+                        return True
+        except Exception:
+            pass
+        return False
+
     # ─── Greenhouse ────────────────────────────────────────────────────────────
 
     async def _fill_greenhouse(self, job, insight, cover_letter, profile, app_id) -> bool:
-        """Fill Greenhouse form — no account needed, direct form."""
+        """
+        Fill Greenhouse form robustly.
+        Handles cookies, country/state dropdowns, cover letter Enter manually,
+        graduation date dropdowns, and all custom questions.
+        """
         try:
             print(f"[Track {self.track_id}] Filling Greenhouse form...")
 
-            # Wait for form
-            await self.page.wait_for_selector(
-                "form#application_form, #application-form, form[action*='applications']",
-                timeout=12000
-            )
+            # 1. Dismiss cookie/consent popups first
+            await self._dismiss_popups()
+            await self._delay(1, 2)
+
+            # 2. Wait for form
+            try:
+                await self.page.wait_for_selector(
+                    "form#application_form, #application-form, "
+                    "form[action*='applications'], .application-form",
+                    timeout=12000
+                )
+            except Exception:
+                pass
             await self._delay(1, 2)
 
             full_name = profile.get("full_name", "") or ""
             fname = full_name.split()[0] if full_name else ""
-            lname = full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name
+            lname = (full_name.split()[-1]
+                     if full_name and len(full_name.split()) > 1 else full_name)
 
-            # Standard fields
-            field_map = {
-                "first_name": fname,
-                "last_name":  lname,
-                "email":      profile.get("email", ""),
-                "phone":      profile.get("phone", ""),
-                "resume":     profile.get("resume_path", ""),
-            }
-            for field_id, value in field_map.items():
+            # 3. Basic text fields
+            for field_id, value in [
+                ("first_name", fname), ("last_name", lname),
+                ("email", profile.get("email", "")),
+                ("phone", profile.get("phone", "")),
+            ]:
                 if value:
                     await self._fill_by_id(field_id, value)
+                    await self._delay(0.2, 0.4)
 
-            # LinkedIn / portfolio
+            # 4. Country dropdown — select, don't type
+            for sel in [
+                "select#country",
+                "select[name='job_application[country]']",
+                "select[name*='country']",
+                "select[id*='country']",
+            ]:
+                if await self._select_dropdown(sel, "United States"):
+                    await self._delay(0.5, 1)
+                    break
+
+            # 5. State dropdown
+            addr = profile.get("address", "") or ""
+            state = addr.split(",")[1].strip() if "," in addr else "Indiana"
+            for sel in ["select#state", "select[name*='state']", "select[id*='state']"]:
+                if await self._select_dropdown(sel, state):
+                    await self._delay(0.3, 0.6)
+                    break
+
+            # 6. Resume upload
+            await self._upload_resume(profile)
+
+            # 7. Cover letter — click "Enter manually" first
+            cover_entered = False
+            for enter_sel in [
+                "button:has-text('Enter manually')",
+                "a:has-text('Enter manually')",
+                "[data-source='paste']",
+            ]:
+                try:
+                    btn = await self.page.query_selector(enter_sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        await self._delay(1, 2)
+                        for ta_sel in [
+                            "textarea[name*='cover']", "textarea[id*='cover']",
+                            "textarea[name*='letter']",
+                            "textarea[placeholder*='cover' i]",
+                            ".cover-letter textarea", "#cover_letter",
+                        ]:
+                            ta = await self.page.query_selector(ta_sel)
+                            if ta:
+                                await ta.fill(cover_letter)
+                                cover_entered = True
+                                break
+                        break
+                except Exception:
+                    continue
+
+            if not cover_entered:
+                for ta_sel in [
+                    "textarea[name*='cover']", "textarea[id*='cover']",
+                    "textarea[name*='letter']",
+                ]:
+                    ta = await self.page.query_selector(ta_sel)
+                    if ta and await ta.is_visible():
+                        await ta.fill(cover_letter)
+                        cover_entered = True
+                        break
+
+            # 8. LinkedIn / portfolio / GitHub
             await self._fill_by_placeholder("LinkedIn", profile.get("linkedin_url", ""))
             await self._fill_by_placeholder("Website", profile.get("portfolio_url", ""))
             await self._fill_by_placeholder("GitHub", profile.get("github_url", ""))
 
-            # Cover letter
-            for sel in ["textarea[name*='cover']", "textarea[id*='cover']",
-                        "textarea[name*='letter']", "[id*='cover_letter'] textarea"]:
-                el = await self.page.query_selector(sel)
-                if el:
-                    await el.fill(cover_letter)
+            # 9. Graduation year/month dropdowns
+            grad_date  = profile.get("graduation_date", "May 2026") or "May 2026"
+            grad_year  = "2026"
+            grad_month = "May"
+            try:
+                parts = grad_date.split()
+                if len(parts) == 2:
+                    grad_month, grad_year = parts[0], parts[1]
+            except Exception:
+                pass
+
+            for yr_sel in [
+                "select[name*='grad'][name*='year']",
+                "select[id*='grad'][id*='year']",
+                "select[name*='graduation_year']",
+                "select[id*='graduation_year']",
+            ]:
+                if await self._select_dropdown(yr_sel, grad_year):
+                    await self._delay(0.3, 0.5)
                     break
 
-            # Resume upload
-            await self._upload_resume(profile)
+            for mo_sel in [
+                "select[name*='grad'][name*='month']",
+                "select[id*='grad'][id*='month']",
+                "select[name*='graduation_month']",
+            ]:
+                if await self._select_dropdown(mo_sel, grad_month):
+                    await self._delay(0.3, 0.5)
+                    break
 
-            # Custom questions
+            # 10. All remaining visible fields
             await self._fill_all_visible_fields(job, insight, cover_letter, profile)
 
-            # Submit
+            # 11. Dismiss any new popups
+            await self._dismiss_popups()
             await self._delay(1, 2)
+
+            # 12. Submit
             return await self._click_submit_and_verify()
 
         except Exception as e:
@@ -657,95 +827,298 @@ class TrackWorker:
     async def _fill_all_visible_fields(self, job: Job, insight: dict,
                                         cover_letter: str, profile: dict):
         """
-        Fill ALL visible input fields on the current page using smart mapping.
-        This is the core of the universal form filler.
+        Comprehensively fill every interactive element on the current page.
+        Handles: text inputs, textareas, ALL dropdowns (select + custom),
+        checkboxes, radio buttons, terms/privacy agreements, cover letter,
+        graduation dates, work authorization, demographics — everything.
         """
         full_name = profile.get("full_name", "") or ""
         addr      = profile.get("address", "") or ""
+        grad_date = profile.get("graduation_date", "May 2026") or "May 2026"
 
-        # Master field value map — covers every common field name variant
+        fname = full_name.split()[0] if full_name else ""
+        lname = full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name
+
+        # Parse graduation month/year
+        grad_year  = "2026"
+        grad_month = "May"
+        try:
+            parts = grad_date.split()
+            if len(parts) == 2:
+                grad_month, grad_year = parts[0], parts[1]
+        except Exception:
+            pass
+
+        # Master value map — every possible field label variant
         VALUE_MAP = {
-            # Name variants
-            "first":        full_name.split()[0] if full_name else "",
-            "fname":        full_name.split()[0] if full_name else "",
-            "given":        full_name.split()[0] if full_name else "",
-            "last":         full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name,
-            "lname":        full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name,
-            "family":       full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name,
-            "surname":      full_name.split()[-1] if full_name and len(full_name.split()) > 1 else full_name,
-            "fullname":     full_name,
-            "full_name":    full_name,
-            "name":         full_name,
+            # Name
+            "first": fname, "fname": fname, "given": fname,
+            "given name": fname, "first name": fname,
+            "last": lname, "lname": lname, "family": lname,
+            "surname": lname, "last name": lname, "family name": lname,
+            "full name": full_name, "fullname": full_name, "name": full_name,
+            "legal name": full_name, "your name": full_name,
             # Contact
-            "email":        profile.get("email", ""),
-            "mail":         profile.get("email", ""),
-            "phone":        profile.get("phone", ""),
-            "telephone":    profile.get("phone", ""),
-            "mobile":       profile.get("phone", ""),
-            "cell":         profile.get("phone", ""),
+            "email": profile.get("email", ""),
+            "email address": profile.get("email", ""),
+            "e-mail": profile.get("email", ""),
+            "phone": profile.get("phone", ""),
+            "phone number": profile.get("phone", ""),
+            "telephone": profile.get("phone", ""),
+            "mobile": profile.get("phone", ""),
+            "cell": profile.get("phone", ""),
             # Location
-            "address":      addr.split(",")[0].strip(),
-            "street":       addr.split(",")[0].strip(),
-            "city":         addr.split(",")[0].strip() if "," in addr else addr,
-            "zip":          "",
-            "postal":       "",
-            "state":        addr.split(",")[1].strip() if addr.count(",") >= 1 else "IN",
-            "country":      "United States",
-            # Professional links
-            "linkedin":     profile.get("linkedin_url", ""),
-            "github":       profile.get("github_url", ""),
-            "website":      profile.get("portfolio_url", ""),
-            "portfolio":    profile.get("portfolio_url", ""),
-            "url":          profile.get("portfolio_url", ""),
+            "address": addr.split(",")[0].strip(),
+            "street": addr.split(",")[0].strip(),
+            "street address": addr.split(",")[0].strip(),
+            "city": addr.split(",")[0].strip() if "," in addr else addr,
+            "state": addr.split(",")[1].strip() if addr.count(",") >= 1 else "Indiana",
+            "country": "United States",
+            "zip": "47906", "zip code": "47906",
+            "postal": "47906", "postal code": "47906",
+            # Professional
+            "linkedin": profile.get("linkedin_url", ""),
+            "linkedin url": profile.get("linkedin_url", ""),
+            "linkedin profile": profile.get("linkedin_url", ""),
+            "github": profile.get("github_url", ""),
+            "github url": profile.get("github_url", ""),
+            "website": profile.get("portfolio_url", ""),
+            "portfolio": profile.get("portfolio_url", ""),
+            "personal website": profile.get("portfolio_url", ""),
+            "portfolio url": profile.get("portfolio_url", ""),
+            "personal url": profile.get("portfolio_url", ""),
             # Cover letter
-            "cover":        cover_letter,
-            "letter":       cover_letter,
-            "motivation":   cover_letter,
-            "message":      cover_letter[:1000],
-            "additional":   cover_letter[:500],
-            "comments":     cover_letter[:500],
-            "anything":     cover_letter[:500],
+            "cover letter": cover_letter, "cover": cover_letter,
+            "letter": cover_letter, "motivation": cover_letter,
+            "motivation letter": cover_letter,
+            "message": cover_letter[:1000], "comments": cover_letter[:500],
+            "additional comments": cover_letter[:500],
+            "anything else": cover_letter[:300],
+            "additional information": cover_letter[:500],
+            "tell us about yourself": cover_letter[:500],
+            "why do you want": cover_letter[:400],
+            "why are you interested": cover_letter[:400],
             # Academic
-            "gpa":          profile.get("gpa", ""),
-            "grade":        profile.get("gpa", ""),
-            "graduation":   profile.get("graduation_date", ""),
-            "graduate":     profile.get("graduation_date", ""),
-            "degree":       "Bachelor of Science",
-            "major":        "Computer Science",
-            "university":   "Purdue University",
-            "school":       "Purdue University",
-            "college":      "Purdue University",
-            "institution":  "Purdue University",
+            "gpa": profile.get("gpa", "3.8"), "grade point": profile.get("gpa", "3.8"),
+            "graduation": grad_date, "graduation date": grad_date,
+            "graduation year": grad_year, "grad year": grad_year,
+            "graduation month": grad_month, "grad month": grad_month,
+            "expected graduation": grad_date,
+            "degree": "Bachelor of Science", "degree type": "Bachelor of Science",
+            "major": "Computer Science", "field of study": "Computer Science",
+            "area of study": "Computer Science",
+            "university": "Purdue University", "school": "Purdue University",
+            "college": "Purdue University", "institution": "Purdue University",
+            "program": "Computer Science",
             # Work auth
-            "authorized":   "Yes",
-            "authorization":"Yes",
-            "eligible":     "Yes",
-            "sponsorship":  "No",
-            "sponsor":      "No",
-            "visa":         "No",
-            "citizen":      "Yes",
-            # Compensation
-            "salary":       str(profile.get("salary_min", 20)),
-            "compensation": str(profile.get("salary_min", 20)),
-            "pay":          str(profile.get("salary_min", 20)),
+            "authorized": "Yes", "work authorized": "Yes",
+            "authorization": "Yes", "legally authorized": "Yes",
+            "eligible to work": "Yes", "eligible": "Yes",
+            "sponsorship": "No", "require sponsorship": "No",
+            "visa sponsorship": "No", "sponsor": "No",
+            "visa": "No", "visa status": "Citizen/Permanent Resident",
+            "citizen": "Yes", "us citizen": "Yes",
             # Availability
-            "start":        "May 2026",
-            "available":    "May 2026",
-            "begin":        "May 2026",
-            "relocate":     "Yes",
-            "remote":       "Yes",
-            # Misc
-            "hear":         "LinkedIn",
-            "source":       "Online",
-            "referral":     "Online job posting",
-            "experience":   "0-1 years",
-            "years":        "0",
+            "start date": "May 2026", "start": "May 2026",
+            "available": "May 2026", "availability": "May 2026",
+            "earliest start": "May 2026",
+            "relocate": "Yes", "willing to relocate": "Yes",
+            "remote": "Yes", "work remotely": "Yes",
+            # How did you hear
+            "hear about": "LinkedIn", "how did you hear": "LinkedIn",
+            "referral": "Online", "source": "Online job posting",
+            "where did you": "LinkedIn",
+            # Experience
+            "years of experience": "0", "experience": "0-1 years",
+            "years": "0",
+            # Salary
+            "salary": str(profile.get("salary_min", 20)),
+            "compensation": str(profile.get("salary_min", 20)),
+            "expected salary": str(profile.get("salary_min", 20)),
+            "desired salary": str(profile.get("salary_min", 20)),
         }
 
-        # Fill text inputs
+        # ── STEP 1: Handle ALL <select> dropdowns ─────────────────────────────
+        selects = await self.page.query_selector_all("select:not([disabled])")
+        for sel_el in selects:
+            try:
+                if not await sel_el.is_visible():
+                    continue
+
+                label_text = (await self._get_field_label(sel_el) or "").lower().strip()
+
+                # Map label to the right selection
+                chosen = None
+                if any(k in label_text for k in ["country"]):
+                    for v in ["United States", "US", "USA", "United States of America"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+                    if not chosen:
+                        try:
+                            await sel_el.select_option(value="US")
+                            chosen = "US"
+                        except Exception:
+                            pass
+
+                elif any(k in label_text for k in ["state", "province", "region"]):
+                    state_val = addr.split(",")[1].strip() if "," in addr else "Indiana"
+                    for v in [state_val, "IN", "Indiana"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            try:
+                                await sel_el.select_option(value=v[:2].upper())
+                                chosen = v; break
+                            except Exception:
+                                continue
+
+                elif any(k in label_text for k in ["graduation year", "grad year", "class year"]):
+                    for v in [grad_year, "2026", "2027"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            try:
+                                await sel_el.select_option(value=v)
+                                chosen = v; break
+                            except Exception:
+                                continue
+
+                elif any(k in label_text for k in ["graduation month", "grad month"]):
+                    for v in [grad_month, "May", "5"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["degree", "education level", "highest degree"]):
+                    for v in ["Bachelor", "Bachelor's", "Bachelor's Degree",
+                              "BS", "B.S.", "Undergraduate"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["gender", "sex"]):
+                    for v in ["Female", "Woman", "F", "Prefer not to say",
+                              "I prefer not to answer"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["ethnicity", "race", "racial"]):
+                    for v in ["Asian", "Asian or Pacific Islander",
+                              "Prefer not to say", "I prefer not to answer",
+                              "Decline to Self Identify"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["veteran", "military"]):
+                    for v in ["I am not a protected veteran",
+                              "Not a Veteran", "No", "Prefer not to say"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["disability", "disabled"]):
+                    for v in ["No, I don't have a disability",
+                              "I don't have a disability",
+                              "No", "Prefer not to say"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in
+                         ["sponsor", "authorization", "authorized", "visa",
+                          "work auth", "legally"]):
+                    for v in ["Yes", "Yes, I am authorized",
+                              "No sponsorship required",
+                              "US Citizen", "Authorized to work"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["experience", "years of"]):
+                    for v in ["0-1 years", "Less than 1 year",
+                              "0", "Entry Level", "< 1 year", "Intern"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["hear", "source", "referral", "find"]):
+                    for v in ["LinkedIn", "Job Board", "Online",
+                              "Internet", "Other"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["employment type", "job type"]):
+                    for v in ["Internship", "Intern", "Full-time"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                elif any(k in label_text for k in ["relocate", "remote", "location preference"]):
+                    for v in ["Yes", "Open to both", "Remote", "Flexible"]:
+                        try:
+                            await sel_el.select_option(label=v)
+                            chosen = v; break
+                        except Exception:
+                            continue
+
+                else:
+                    # Unknown dropdown — try value map first
+                    for key, val in VALUE_MAP.items():
+                        if key in label_text and val:
+                            try:
+                                await sel_el.select_option(label=str(val))
+                                chosen = val; break
+                            except Exception:
+                                continue
+
+                    # Last resort: skip index 0 (placeholder), pick index 1
+                    if not chosen:
+                        opts_count = await sel_el.evaluate("el => el.options.length")
+                        if opts_count > 1:
+                            try:
+                                await sel_el.select_option(index=1)
+                            except Exception:
+                                pass
+
+                if chosen:
+                    await self._delay(0.2, 0.5)
+
+            except Exception:
+                continue
+
+        # ── STEP 2: Fill text inputs and textareas ────────────────────────────
         inputs = await self.page.query_selector_all(
-            "input:not([type='hidden']):not([type='file']):not([type='checkbox'])"
-            ":not([type='radio']):not([type='submit']):not([type='button']), "
+            "input:not([type='hidden']):not([type='file'])"
+            ":not([type='checkbox']):not([type='radio'])"
+            ":not([type='submit']):not([type='button']), "
             "textarea"
         )
 
@@ -754,123 +1127,205 @@ class TrackWorker:
                 if not await inp.is_visible():
                     continue
 
-                # Get field identifier
                 label_text = await self._get_field_label(inp)
                 if not label_text:
                     continue
 
                 label_lower = label_text.lower().strip()
 
-                # Check value map
+                # Check value map (longest key match first for specificity)
                 value = ""
+                best_key_len = 0
                 for key, val in VALUE_MAP.items():
-                    if key in label_lower and val:
+                    if key in label_lower and len(key) > best_key_len and val:
                         value = str(val)
-                        break
+                        best_key_len = len(key)
 
                 # Fall back to learned answers
                 if not value:
                     value = self.store.find_learned_answer(label_lower) or ""
 
-                # Fall back to AI generation for custom questions
-                if not value and len(label_lower) > 10 and "?" in label_text:
-                    value = generate_form_answer(label_text, job.title, job.company, insight)
+                # AI generation for custom questions
+                if not value and len(label_lower) > 8:
+                    if any(sig in label_lower for sig in
+                           ["?", "why", "tell us", "describe", "explain",
+                            "how", "what", "share"]):
+                        value = generate_form_answer(
+                            label_text, job.title, job.company, insight
+                        )
 
                 if value:
-                    tag = (await inp.evaluate("el => el.tagName")).lower()
-                    current = await inp.input_value() if tag == "input" else await inp.evaluate("el => el.value") or ""
-                    if not current:  # Don't overwrite
-                        if tag == "textarea":
-                            await inp.fill(value)
-                        else:
-                            await inp.fill(value)
-                        await self._delay(0.1, 0.4)
+                    try:
+                        current = await inp.input_value()
+                    except Exception:
+                        current = ""
+                    if not current:
+                        await inp.fill(value)
+                        await self._delay(0.1, 0.3)
 
             except Exception:
                 continue
 
-        # Fill select dropdowns
-        selects = await self.page.query_selector_all("select:not([disabled])")
-        for sel_el in selects:
+        # ── STEP 3: Radio buttons ─────────────────────────────────────────────
+        # Group radio buttons by name and select the right option
+        radios = await self.page.query_selector_all("input[type='radio']:not([disabled])")
+        radio_groups: dict = {}
+        for radio in radios:
             try:
-                if not await sel_el.is_visible():
-                    continue
+                name = await radio.get_attribute("name") or ""
+                if name not in radio_groups:
+                    radio_groups[name] = []
+                radio_groups[name].append(radio)
+            except Exception:
+                continue
 
-                label_text = await self._get_field_label(sel_el)
-                label_lower = (label_text or "").lower()
-
-                if any(kw in label_lower for kw in ["country"]):
+        for group_name, group_radios in radio_groups.items():
+            try:
+                # Check if any already selected
+                any_selected = False
+                for r in group_radios:
                     try:
-                        await sel_el.select_option(label="United States")
-                    except Exception:
-                        try:
-                            await sel_el.select_option(value="US")
-                        except Exception:
-                            pass
-                elif any(kw in label_lower for kw in ["state", "province"]):
-                    addr = profile.get("address", "")
-                    state = addr.split(",")[-1].strip() if "," in addr else "IN"
-                    try:
-                        await sel_el.select_option(label=state)
+                        if await r.is_checked():
+                            any_selected = True
+                            break
                     except Exception:
                         pass
-                elif any(kw in label_lower for kw in ["authorization", "sponsor", "visa", "work auth"]):
-                    for opt in ["Yes", "No Sponsorship Required", "US Citizen",
-                                "Authorized", "I am authorized"]:
+                if any_selected:
+                    continue
+
+                # Get group label from first radio's label
+                group_label = ""
+                for r in group_radios:
+                    lbl = (await self._get_field_label(r)).lower()
+                    if lbl:
+                        group_label = lbl
+                        break
+
+                group_lower = group_label.lower()
+
+                # Determine which option to select
+                target_value = None
+
+                if any(k in group_lower for k in
+                       ["sponsor", "visa", "require sponsor"]):
+                    target_value = "no"  # No sponsorship required
+                elif any(k in group_lower for k in
+                         ["authorized", "eligible", "work auth", "legally"]):
+                    target_value = "yes"
+                elif any(k in group_lower for k in ["relocate", "relocation"]):
+                    target_value = "yes"
+                elif any(k in group_lower for k in ["remote", "work from home"]):
+                    target_value = "yes"
+                elif any(k in group_lower for k in ["veteran", "military service"]):
+                    target_value = "no"
+                elif any(k in group_lower for k in ["disability"]):
+                    target_value = "no"
+                elif any(k in group_lower for k in ["gender"]):
+                    target_value = "female"
+                elif any(k in group_lower for k in ["citizen"]):
+                    target_value = "yes"
+
+                if target_value:
+                    for r in group_radios:
                         try:
-                            await sel_el.select_option(label=opt)
-                            break
+                            radio_val = (await r.get_attribute("value") or "").lower()
+                            radio_lbl = (await self._get_field_label(r)).lower()
+                            if (target_value in radio_val or
+                                    target_value in radio_lbl):
+                                if await r.is_visible():
+                                    await r.click()
+                                    await self._delay(0.2, 0.5)
+                                    break
                         except Exception:
                             continue
-                elif any(kw in label_lower for kw in ["experience", "years"]):
-                    for opt in ["0-1 years", "Less than 1 year", "0", "Entry Level", "<1"]:
+                else:
+                    # Unknown group — click first visible radio (safest)
+                    for r in group_radios:
                         try:
-                            await sel_el.select_option(label=opt)
-                            break
+                            if await r.is_visible():
+                                await r.click()
+                                await self._delay(0.2, 0.4)
+                                break
                         except Exception:
                             continue
-                elif any(kw in label_lower for kw in ["degree", "education"]):
-                    for opt in ["Bachelor", "Bachelor's", "Undergraduate", "BS"]:
-                        try:
-                            await sel_el.select_option(label=opt)
-                            break
-                        except Exception:
-                            continue
-                elif any(kw in label_lower for kw in ["gender"]):
-                    try:
-                        await sel_el.select_option(label="Female")
-                    except Exception:
-                        try:
-                            await sel_el.select_option(label="Woman")
-                        except Exception:
-                            try:
-                                await sel_el.select_option(label="Prefer not to say")
-                            except Exception:
-                                pass
 
             except Exception:
                 continue
 
-        # Handle checkboxes (agreements/consents)
-        checkboxes = await self.page.query_selector_all("input[type='checkbox']")
+        # ── STEP 4: Checkboxes — agreements, T&C, privacy ────────────────────
+        checkboxes = await self.page.query_selector_all(
+            "input[type='checkbox']:not([disabled])"
+        )
         for cb in checkboxes:
             try:
                 if not await cb.is_visible():
                     continue
-                is_checked = await cb.is_checked()
-                if is_checked:
+                if await cb.is_checked():
                     continue
 
                 label_text = (await self._get_field_label(cb)).lower()
+
+                # Always check agreement/consent checkboxes
                 if any(kw in label_text for kw in [
                     "agree", "accept", "consent", "acknowledge",
                     "certify", "authorize", "terms", "privacy",
-                    "confirm", "understand"
+                    "confirm", "understand", "i have read",
+                    "conditions", "policy", "eeo", "equal opportunity",
+                    "background check", "drug", "at-will",
                 ]):
                     await cb.click()
-                    await self._delay(0.2, 0.5)
+                    await self._delay(0.2, 0.4)
+
+                # Check work auth / no disability / not veteran boxes
+                elif any(kw in label_text for kw in [
+                    "authorized to work", "eligible to work",
+                    "no disability", "not a veteran",
+                    "18 years", "18 or older",
+                ]):
+                    await cb.click()
+                    await self._delay(0.2, 0.4)
+
             except Exception:
                 continue
+
+        # ── STEP 5: Scroll terms/T&C iframes or scrollable divs ──────────────
+        # Some sites require scrolling through T&C before Accept button appears
+        try:
+            scrollable_divs = await self.page.query_selector_all(
+                "div[class*='scroll'], div[class*='terms'], "
+                "div[class*='agreement'], iframe[src*='terms']"
+            )
+            for div in scrollable_divs:
+                try:
+                    if await div.is_visible():
+                        await div.evaluate(
+                            "el => el.scrollTop = el.scrollHeight"
+                        )
+                        await self._delay(0.5, 1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ── STEP 6: Cover letter final fallback ───────────────────────────────
+        # If no cover letter field was filled yet, try one more time
+        try:
+            for ta_sel in [
+                "textarea[name*='cover']", "textarea[id*='cover']",
+                "textarea[name*='letter']",
+                "textarea[placeholder*='cover' i]",
+                "textarea[placeholder*='letter' i]",
+                "textarea[aria-label*='cover' i]",
+            ]:
+                ta = await self.page.query_selector(ta_sel)
+                if ta and await ta.is_visible():
+                    current = await ta.evaluate("el => el.value")
+                    if not current:
+                        await ta.fill(cover_letter)
+                        await self._delay(0.3, 0.6)
+                        break
+        except Exception:
+            pass
 
     # ─── Resume upload ─────────────────────────────────────────────────────────
 
