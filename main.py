@@ -265,6 +265,8 @@ class DashboardTab(QWidget):
         # VPN monitor — alerts when Google gets rate-limited
         from discovery.vpn_monitor import get_vpn_monitor
         get_vpn_monitor().start()
+        from discovery.vpn_controller import get_vpn_controller
+        get_vpn_controller().start()
         self._is_running = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)

@@ -1,13 +1,14 @@
 """
 discovery/discovery_manager.py
-Runs all discovery sources in parallel background coroutines.
+Runs all discovery sources in parallel.
 
 Sources:
-1. API discovery (SimplyHired, Remotive, USAJobs, Muse) — every 20 min
-2. Playwright scraper (Built In, Wellfound, YC, Internships.com) — every 30 min
-3. Google ATS search — when VPN enabled, every 30 min
-4. Deep web scan (HN, YC API) — every 45 min
-5. Advice scraper — once at startup
+1. Direct ATS scraper  — Greenhouse/Lever/Ashby APIs, zero login needed
+2. API discovery       — SimplyHired, Remotive, USAJobs, Muse
+3. Playwright scraper  — Built In, Wellfound, YC (headless browser)
+4. Google ATS search   — VPN required, direct ATS links
+5. Deep web scan       — HN, YC API
+6. Advice scraper      — once at startup
 """
 
 import asyncio
@@ -30,9 +31,7 @@ class DiscoveryManager:
         self._stop_event.clear()
         self.running = True
         self._thread = threading.Thread(
-            target=self._run_loop,
-            daemon=True,
-            name="DiscoveryManager"
+            target=self._run_loop, daemon=True, name="DiscoveryManager"
         )
         self._thread.start()
         print("[Discovery] All sources starting...")
@@ -50,34 +49,44 @@ class DiscoveryManager:
         try:
             loop.run_until_complete(self._async_main())
         except Exception as e:
-            print(f"[Discovery] Error in discovery loop: {e}")
+            print(f"[Discovery] Error: {e}")
         finally:
             loop.close()
 
     async def _async_main(self):
         import json
-
-        enabled_platforms = self.store.get("platforms", [])
-        if isinstance(enabled_platforms, str):
+        enabled = self.store.get("platforms", [])
+        if isinstance(enabled, str):
             try:
-                enabled_platforms = json.loads(enabled_platforms)
+                enabled = json.loads(enabled)
             except Exception:
-                enabled_platforms = []
+                enabled = []
 
         tasks = []
 
-        # ── 1. API discovery — SimplyHired, Remotive, USAJobs, Muse ──────────
+        # 1. Direct ATS scraper — Greenhouse/Lever/Ashby (BEST SOURCE)
+        try:
+            from discovery.greenhouse_lever_scraper import run_ats_scraping
+            tasks.append(asyncio.create_task(
+                run_ats_scraping(continuous=True, stop_event=self._stop_event),
+                name="ATSScraper"
+            ))
+            print("[Discovery] Direct ATS scraper started (Greenhouse/Lever/Ashby)")
+        except Exception as e:
+            print(f"[Discovery] ATS scraper error: {e}")
+
+        # 2. API discovery — SimplyHired, Remotive, USAJobs, Muse
         try:
             from discovery.api_discovery import run_api_discovery
             tasks.append(asyncio.create_task(
                 run_api_discovery(continuous=True, stop_event=self._stop_event),
                 name="APIDiscovery"
             ))
-            print("[Discovery] API discovery started (SimplyHired, Remotive, USAJobs, Muse)")
+            print("[Discovery] API discovery started")
         except Exception as e:
-            print(f"[Discovery] Could not start API discovery: {e}")
+            print(f"[Discovery] API discovery error: {e}")
 
-        # ── 2. Playwright scraper — Built In, Wellfound, YC, Internships ──────
+        # 3. Playwright scraper — Built In, Wellfound, YC
         try:
             from discovery.playwright_scraper import run_playwright_scraping
             tasks.append(asyncio.create_task(
@@ -86,9 +95,9 @@ class DiscoveryManager:
             ))
             print("[Discovery] Playwright scraper started (Built In, Wellfound, YC)")
         except Exception as e:
-            print(f"[Discovery] Could not start Playwright scraper: {e}")
+            print(f"[Discovery] Playwright scraper error: {e}")
 
-        # ── 3. Advice scraping — once at startup ──────────────────────────────
+        # 4. Advice scraper — once at startup
         try:
             from research.advice_scraper import run_advice_scraping
             tasks.append(asyncio.create_task(
@@ -96,22 +105,22 @@ class DiscoveryManager:
                 name="AdviceScraper"
             ))
         except Exception as e:
-            print(f"[Discovery] Could not start advice scraper: {e}")
+            print(f"[Discovery] Advice scraper error: {e}")
 
-        # ── 4. Google ATS search — when VPN enabled ───────────────────────────
-        if not enabled_platforms or "Google ATS Deep Search" in enabled_platforms:
+        # 5. Google ATS search — needs VPN
+        if not enabled or "Google ATS Deep Search" in enabled:
             try:
                 from discovery.google_search import run_google_discovery
                 tasks.append(asyncio.create_task(
                     run_google_discovery(continuous=True, stop_event=self._stop_event),
                     name="GoogleSearch"
                 ))
-                print("[Discovery] Google ATS search enabled (use VPN, 30 min cycles)")
+                print("[Discovery] Google ATS search enabled (use VPN)")
             except Exception as e:
-                print(f"[Discovery] Could not start Google search: {e}")
+                print(f"[Discovery] Google search error: {e}")
 
-        # ── 5. Deep web scan — HN, YC API ─────────────────────────────────────
-        if not enabled_platforms or "Deep Web Scan" in enabled_platforms:
+        # 6. Deep web scan
+        if not enabled or "Deep Web Scan" in enabled:
             try:
                 from discovery.deep_web_scanner import run_deep_web_discovery
                 tasks.append(asyncio.create_task(
@@ -119,10 +128,10 @@ class DiscoveryManager:
                     name="DeepWebScan"
                 ))
             except Exception as e:
-                print(f"[Discovery] Deep web scanner: {e}")
+                print(f"[Discovery] Deep web scan error: {e}")
 
         if not tasks:
-            print("[Discovery] Warning: no discovery sources started")
+            print("[Discovery] Warning: no sources started")
             return
 
         self.status_cb("all", f"Running {len(tasks)} discovery sources")
