@@ -1,8 +1,14 @@
 """
-tracks/track_worker.py  —  FINAL VERSION
-All function signatures verified against actual codebase.
-Includes: approval dialog, aggregator escape, universal form fill,
-          verified dropdown selection, strict submission confirmation.
+tracks/track_worker.py — FINAL VERSION
+Fixes in this version:
+  1. Empty label bug fixed — "" in key is always True in Python, now caught early
+  2. React event dispatching — uses JS dispatchEvent so React registers value changes
+  3. Greenhouse fields protected from universal_fill overwrite
+  4. Graduation dropdown clears field before typing, handles "No options" gracefully
+  5. Aggregator: scans page HTML for ATS links before any clicking
+  6. Generic listing pages: follows Apply button to real form, catches new tabs
+  7. Strict confirmation — no false positives
+  8. Approval dialog restored
 """
 
 from __future__ import annotations
@@ -19,11 +25,10 @@ from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeo
 from core.settings_store import get_store
 from discovery.job_pool import get_pool
 
-# ── Optional imports — verified signatures ────────────────────────────────────
+# ── Optional imports ──────────────────────────────────────────────────────────
 
 try:
     from tracks.cover_letter_gen import generate_cover_letter as _gcl
-    # Signature: generate_cover_letter(job_title, company, job_description, insight) -> str
     def _make_cover_letter(job, insight: dict) -> str:
         return _gcl(
             job_title=job.title,
@@ -35,20 +40,17 @@ except ImportError:
     def _make_cover_letter(job, insight: dict) -> str:
         return (
             f"I am excited to apply for the {job.title} position at {job.company}. "
-            "My background in Computer Science and hands-on project experience make me "
-            "a strong candidate. I look forward to contributing to your team."
+            "My background in Computer Science and hands-on experience make me a strong candidate."
         )
 
 try:
     from tracks.humanizer_check import ensure_humanized
-    # Signature: ensure_humanized(text, company, title) -> (str, float, int)
     _has_humanizer = True
 except ImportError:
     _has_humanizer = False
 
 try:
     from research.company_researcher import research_company
-    # Signature: async research_company(company, title, description) -> dict
     _has_researcher = True
 except ImportError:
     _has_researcher = False
@@ -61,14 +63,19 @@ except ImportError:
 
 try:
     from ui.approval_queue import request_approval
-    # Signature: request_approval(job_data, insight, cover_letter) -> (action, cover_letter)
     _has_approval = True
 except ImportError:
     _has_approval = False
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 PROFILE_PATH_BASE = Path.home() / ".autoapplyai"
+
+# Greenhouse standard field IDs — universal_fill must never touch these
+GREENHOUSE_PROTECTED = {
+    "first_name", "last_name", "email", "phone",
+    "first_name", "last_name",
+}
 
 CONFIRMATION_PHRASES = [
     "thank you for your application",
@@ -123,7 +130,7 @@ POPUP_SELECTORS = [
 DROPDOWN_MIN_CONFIDENCE = 0.45
 
 
-# ─── ATS Detection ────────────────────────────────────────────────────────────
+# ── ATS Detection ─────────────────────────────────────────────────────────────
 
 def _detect_ats(url: str) -> str:
     u = url.lower()
@@ -140,7 +147,7 @@ def _detect_ats(url: str) -> str:
     return "generic"
 
 
-# ─── Option Scoring ───────────────────────────────────────────────────────────
+# ── Option Scoring ────────────────────────────────────────────────────────────
 
 def _score_option(option_text: str, target: str) -> float:
     o = option_text.strip().lower()
@@ -161,7 +168,62 @@ def _score_option(option_text: str, target: str) -> float:
     return 0.0
 
 
-# ─── TrackWorker ──────────────────────────────────────────────────────────────
+# ── JS React-safe field setter ────────────────────────────────────────────────
+
+async def _js_set_value(page: Page, selector: str, value: str) -> bool:
+    """
+    Set a field value using JavaScript with proper React event dispatching.
+    React ignores direct .value assignments — we must use the native input descriptor
+    and fire synthetic events so React's state updates correctly.
+    """
+    try:
+        result = await page.evaluate(f"""(selector, value) => {{
+            const el = document.querySelector(selector);
+            if (!el) return false;
+            // Use React's internal setter to bypass controlled component lock
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            );
+            if (nativeInputValueSetter && nativeInputValueSetter.set) {{
+                nativeInputValueSetter.set.call(el, value);
+            }} else {{
+                el.value = value;
+            }}
+            el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            el.dispatchEvent(new Event('blur',   {{bubbles: true}}));
+            return true;
+        }}""", selector, value)
+        return bool(result)
+    except Exception:
+        return False
+
+
+async def _js_set_textarea(page: Page, selector: str, value: str) -> bool:
+    """Same as _js_set_value but for textareas."""
+    try:
+        result = await page.evaluate(f"""(selector, value) => {{
+            const el = document.querySelector(selector);
+            if (!el) return false;
+            const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype, 'value'
+            );
+            if (setter && setter.set) {{
+                setter.set.call(el, value);
+            }} else {{
+                el.value = value;
+            }}
+            el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            el.dispatchEvent(new Event('blur',   {{bubbles: true}}));
+            return true;
+        }}""", selector, value)
+        return bool(result)
+    except Exception:
+        return False
+
+
+# ── TrackWorker ───────────────────────────────────────────────────────────────
 
 class TrackWorker:
     def __init__(self, track_id: int, stop_event=None,
@@ -175,7 +237,6 @@ class TrackWorker:
         self.store       = get_store()
         self.pool        = get_pool()
 
-        # Wrap callback — never crashes regardless of signature
         _cb = status_callback or status_cb
         if _cb:
             import inspect
@@ -261,11 +322,9 @@ class TrackWorker:
             try:
                 raw = await asyncio.wait_for(
                     research_company(
-                        job.company,
-                        job.title,
+                        job.company, job.title,
                         getattr(job, "description", "") or ""
-                    ),
-                    timeout=90
+                    ), timeout=90
                 )
                 insight = synthesize(raw) if _has_synthesizer else (raw or {})
             except Exception as e:
@@ -286,7 +345,7 @@ class TrackWorker:
             except Exception as e:
                 print(f"[Track {self.track_id}] Humanizer error: {e}")
 
-        # 4. Approval dialog (blocks until user approves/skips)
+        # 4. Approval dialog
         if _has_approval:
             try:
                 job_data = {
@@ -304,7 +363,7 @@ class TrackWorker:
                     None, lambda: request_approval(job_data, insight, cl)
                 )
                 if action == "skip":
-                    print(f"[Track {self.track_id}] Skipped by user: {job.title}")
+                    print(f"[Track {self.track_id}] Skipped: {job.title}")
                     self.pool.mark_done(job.job_id, "skipped")
                     return
             except Exception as e:
@@ -313,7 +372,7 @@ class TrackWorker:
         # 5. Apply
         success = await self._apply(job, insight, cl)
         if success:
-            print(f"[Track {self.track_id}] ✅ CONFIRMED SUBMISSION: {job.title} @ {job.company}")
+            print(f"[Track {self.track_id}] ✅ CONFIRMED: {job.title} @ {job.company}")
             self.pool.mark_done(job.job_id, "submitted")
         else:
             print(f"[Track {self.track_id}] ✗ Failed: {job.title} @ {job.company}")
@@ -348,7 +407,7 @@ class TrackWorker:
                         insight, cover_letter, job.job_id
                     )
                 except ImportError:
-                    return await self._fill_generic(job, insight, cover_letter, profile)
+                    pass
             return await self._fill_generic(job, insight, cover_letter, profile)
 
         except PwTimeout:
@@ -361,75 +420,65 @@ class TrackWorker:
     # ── Aggregator Escape ─────────────────────────────────────────────────────
 
     async def _handle_aggregator(self, job, insight, cover_letter: str, profile: dict) -> bool:
-        print(f"[Track {self.track_id}] Aggregator — finding Apply button...")
-        profile = self.store.get_profile() or {}
+        print(f"[Track {self.track_id}] Aggregator — scanning for ATS links...")
 
-        # ── Strategy 1: Scan ALL links on page for direct ATS URLs (no clicking needed) ──
+        # Strategy 1: Scan ALL anchor hrefs for direct ATS URLs (no clicking needed)
         try:
-            all_links = await self.page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('a[href]'))
+            all_hrefs = await self.page.evaluate("""() =>
+                Array.from(document.querySelectorAll('a[href]'))
                     .map(a => a.href)
-                    .filter(h => h && h.startsWith('http'));
-            }""")
-            ats_links = [h for h in all_links if _detect_ats(h) not in ("aggregator", "generic")]
-            if ats_links:
-                best = ats_links[0]
-                ats_type = _detect_ats(best)
-                print(f"[Track {self.track_id}] Found ATS link in page: {best[:70]} → {ats_type}")
-                await self.page.goto(best, timeout=30000, wait_until="domcontentloaded")
+                    .filter(h => h && h.startsWith('http'))
+            """)
+            ats_hrefs = [h for h in all_hrefs if _detect_ats(h) not in ("aggregator", "generic")]
+            if ats_hrefs:
+                target = ats_hrefs[0]
+                ats_type = _detect_ats(target)
+                print(f"[Track {self.track_id}] Found ATS link: {target[:70]} → {ats_type}")
+                await self.page.goto(target, timeout=30000, wait_until="domcontentloaded")
                 await self._delay(1.5, 2.5)
                 await self._dismiss_popups()
+                ats_type = _detect_ats(self.page.url)
                 if ats_type == "greenhouse":
                     return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                elif ats_type == "lever":
+                if ats_type == "lever":
                     return await self._fill_lever(job, insight, cover_letter, profile)
-                else:
-                    return await self._fill_generic(job, insight, cover_letter, profile)
+                return await self._fill_generic(job, insight, cover_letter, profile)
         except Exception as e:
             print(f"[Track {self.track_id}] Link scan error: {e}")
 
-        # ── Strategy 2: Click Apply button and catch new tab OR same-page navigation ──
-        apply_selectors = [
-            "a:has-text('Apply Now')",
-            "button:has-text('Apply Now')",
-            "a:has-text('Apply on company site')",
-            "a:has-text('Apply on Company Site')",
-            "a:has-text('Apply now')",
-            "button:has-text('Apply now')",
-            "[data-testid*='apply']",
-            "a:has-text('Apply')",
-            "button:has-text('Apply')",
-        ]
-
-        for sel in apply_selectors:
+        # Strategy 2: Click apply button, catch new tab or navigation
+        for sel in [
+            "a:has-text('Apply Now')", "button:has-text('Apply Now')",
+            "a:has-text('Apply on company site')", "a:has-text('Apply on Company Site')",
+            "a:has-text('Apply now')", "button:has-text('Apply now')",
+            "[data-testid*='apply']", "a:has-text('Apply')", "button:has-text('Apply')",
+        ]:
             try:
                 btn = await self.page.query_selector(sel)
                 if not btn or not await btn.is_visible():
                     continue
 
-                # Check href first — navigate directly without clicking if it's an ATS link
+                # Check href directly first
                 href = await btn.get_attribute("href") or ""
                 if href and _detect_ats(href) not in ("aggregator", "generic", ""):
-                    print(f"[Track {self.track_id}] Direct ATS href: {href[:70]}")
                     await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
                     await self._delay(1.5, 2.5)
                     await self._dismiss_popups()
-                    new_ats = _detect_ats(self.page.url)
-                    if new_ats == "greenhouse":
+                    ats_type = _detect_ats(self.page.url)
+                    if ats_type == "greenhouse":
                         return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                    elif new_ats == "lever":
+                    if ats_type == "lever":
                         return await self._fill_lever(job, insight, cover_letter, profile)
-                    elif new_ats not in ("aggregator",):
+                    if ats_type not in ("aggregator",):
                         return await self._fill_generic(job, insight, cover_letter, profile)
                     continue
 
-                # Click and watch for new tab (with short timeout)
-                url_before = self.page.url
+                # Click and watch for new tab
                 pages_before = len(self.page.context.pages)
+                url_before   = self.page.url
                 await btn.click()
                 await self._delay(2, 3)
 
-                # Check if a new tab opened
                 pages_after = self.page.context.pages
                 if len(pages_after) > pages_before:
                     new_page = pages_after[-1]
@@ -437,31 +486,27 @@ class TrackWorker:
                         await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
                     except Exception:
                         pass
-                    new_url = new_page.url
-                    new_ats = _detect_ats(new_url)
-                    print(f"[Track {self.track_id}] New tab: {new_url[:70]} → {new_ats}")
+                    new_ats = _detect_ats(new_page.url)
+                    print(f"[Track {self.track_id}] New tab: {new_page.url[:70]} → {new_ats}")
                     if new_ats not in ("aggregator", "generic"):
                         self.page = new_page
                         await self._dismiss_popups()
                         if new_ats == "greenhouse":
                             return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                        elif new_ats == "lever":
+                        if new_ats == "lever":
                             return await self._fill_lever(job, insight, cover_letter, profile)
-                        else:
-                            return await self._fill_generic(job, insight, cover_letter, profile)
+                        return await self._fill_generic(job, insight, cover_letter, profile)
                     await new_page.close()
 
-                # Check if same page navigated
                 if self.page.url != url_before:
-                    new_ats = _detect_ats(self.page.url)
-                    if new_ats not in ("aggregator", "generic"):
+                    ats_type = _detect_ats(self.page.url)
+                    if ats_type not in ("aggregator", "generic"):
                         await self._dismiss_popups()
-                        if new_ats == "greenhouse":
+                        if ats_type == "greenhouse":
                             return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                        elif new_ats == "lever":
+                        if ats_type == "lever":
                             return await self._fill_lever(job, insight, cover_letter, profile)
-                        else:
-                            return await self._fill_generic(job, insight, cover_letter, profile)
+                        return await self._fill_generic(job, insight, cover_letter, profile)
 
             except Exception:
                 continue
@@ -482,7 +527,7 @@ class TrackWorker:
                     await self._delay(0.3, 0.5)
             except Exception:
                 continue
-        for tc_sel in ["[id*='terms']", "[class*='terms']", "div:has-text('Terms of Service')"]:
+        for tc_sel in ["[id*='terms']", "[class*='terms']"]:
             try:
                 tc = await self.page.query_selector(tc_sel)
                 if tc:
@@ -492,7 +537,129 @@ class TrackWorker:
         if dismissed:
             print(f"[Track {self.track_id}] Dismissed {dismissed} popup(s)")
 
-    # ── Dropdown Handling ─────────────────────────────────────────────────────
+    # ── Dropdown: Native Select ───────────────────────────────────────────────
+
+    async def _native_select(self, el, target: str, hint: str = "") -> bool:
+        try:
+            opts = await el.evaluate(
+                "el => Array.from(el.options).map(o => ({value:o.value,text:o.text.trim(),idx:o.index}))"
+            )
+            scored = sorted(
+                [(o, _score_option(o["text"], target)) for o in opts],
+                key=lambda x: x[1], reverse=True
+            )
+            if not scored or scored[0][1] < DROPDOWN_MIN_CONFIDENCE:
+                return False
+            best = scored[0][0]
+            if best["idx"] == 0 and best["value"] in ("", "0", None) and len(scored) > 1:
+                best = scored[1][0]
+            await el.select_option(index=best["idx"])
+            selected = await el.evaluate("el => el.options[el.selectedIndex]?.text?.trim() || ''")
+            if _score_option(selected, target) >= DROPDOWN_MIN_CONFIDENCE:
+                print(f"[Track {self.track_id}] ✓ select '{hint}' → '{selected}'")
+                return True
+            await el.select_option(index=0)
+            return False
+        except Exception:
+            return False
+
+    # ── Dropdown: Custom React-Select ─────────────────────────────────────────
+
+    async def _custom_dropdown(self, trigger_el, target: str, hint: str = "") -> bool:
+        """
+        Handle React-Select / custom dropdowns.
+        Clears existing text before typing to avoid appending.
+        Handles 'No options' by escaping gracefully.
+        """
+        try:
+            # Click to open
+            await trigger_el.click(timeout=3000)
+            await self._delay(0.5, 0.8)
+
+            # Look for a typeable search input inside the dropdown
+            search_input = await self.page.query_selector(
+                "input[class*='select__input'],"
+                "[class*='select__control'] input:not([type='hidden']),"
+                "[role='combobox'] input,"
+                ".select2-search__field"
+            )
+
+            if search_input and await search_input.is_visible():
+                # Clear whatever is already in the field, then type target
+                await search_input.triple_click()
+                await search_input.press("Control+a")
+                await search_input.press("Delete")
+                await self._delay(0.2, 0.3)
+                await search_input.type(target, delay=60)
+                await self._delay(0.6, 1.0)
+
+                # Check for "No options" — if shown, the value doesn't exist
+                no_opts = await self.page.query_selector(
+                    "[class*='no-options'], [class*='noOptions'], "
+                    "div:has-text('No options'), div:has-text('No results')"
+                )
+                if no_opts and await no_opts.is_visible():
+                    print(f"[Track {self.track_id}] ⚠ '{hint}' has no option matching '{target}' — clearing")
+                    await self.page.keyboard.press("Escape")
+                    return False
+
+            # Collect visible options
+            option_els = await self.page.query_selector_all(
+                "[class*='select__option']:not([class*='disabled']),"
+                "[role='option']:not([aria-disabled='true']),"
+                ".select2-results__option:not(.select2-results__option--disabled)"
+            )
+
+            if not option_els:
+                # Try opening again without typing (non-typeable list)
+                await trigger_el.evaluate("el => el.click()")
+                await self._delay(0.5, 0.8)
+                option_els = await self.page.query_selector_all(
+                    "[class*='select__option'],[role='option']"
+                )
+
+            if not option_els:
+                await self.page.keyboard.press("Escape")
+                return False
+
+            # Score all visible options
+            scored = []
+            for opt_el in option_els:
+                try:
+                    if not await opt_el.is_visible():
+                        continue
+                    text = (await opt_el.inner_text()).strip()
+                    if text.lower() in ("no options", "no results", "loading..."):
+                        continue
+                    scored.append((opt_el, text, _score_option(text, target)))
+                except Exception:
+                    continue
+
+            if not scored:
+                await self.page.keyboard.press("Escape")
+                return False
+
+            scored.sort(key=lambda x: x[2], reverse=True)
+            best_el, best_text, best_score = scored[0]
+
+            if best_score < DROPDOWN_MIN_CONFIDENCE:
+                print(f"[Track {self.track_id}] ⚠ No confident match for '{target}' in '{hint}' "
+                      f"(best: '{best_text}' @ {best_score:.2f})")
+                await self.page.keyboard.press("Escape")
+                return False
+
+            await best_el.scroll_into_view_if_needed()
+            await best_el.click(timeout=3000)
+            await self._delay(0.3, 0.5)
+            print(f"[Track {self.track_id}] ✓ custom '{hint}' → '{best_text}' ({best_score:.2f})")
+            return True
+
+        except Exception as e:
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
 
     async def _smart_select(self, field_hint: str, target_value: str) -> bool:
         if not target_value:
@@ -508,87 +675,309 @@ class TrackWorker:
         if not el:
             return False
         tag = await el.evaluate("el => el.tagName.toLowerCase()")
-        return await self._native_select(el, target_value, field_hint) if tag == "select" \
-               else await self._custom_dropdown(el, target_value, field_hint)
+        if tag == "select":
+            return await self._native_select(el, target_value, field_hint)
+        return await self._custom_dropdown(el, target_value, field_hint)
 
-    async def _native_select(self, el, target: str, hint: str = "") -> bool:
-        try:
-            opts = await el.evaluate(
-                "el => Array.from(el.options).map(o => ({value:o.value,text:o.text.trim(),idx:o.index}))"
-            )
-            scored = sorted([(o, _score_option(o["text"], target)) for o in opts],
-                            key=lambda x: x[1], reverse=True)
-            if not scored or scored[0][1] < DROPDOWN_MIN_CONFIDENCE:
-                return False
-            best = scored[0][0]
-            if best["idx"] == 0 and best["value"] in ("", "0", None) and len(scored) > 1:
-                best = scored[1][0]
-            await el.select_option(index=best["idx"])
-            selected = await el.evaluate("el => el.options[el.selectedIndex]?.text?.trim() || ''")
-            if _score_option(selected, target) >= DROPDOWN_MIN_CONFIDENCE:
-                print(f"[Track {self.track_id}] ✓ '{hint}' → '{selected}'")
-                return True
-            await el.select_option(index=0)
-            return False
-        except Exception:
-            return False
+    # ── Greenhouse Form ───────────────────────────────────────────────────────
 
-    async def _custom_dropdown(self, trigger_el, target: str, hint: str = "") -> bool:
+    async def _fill_greenhouse(self, job, insight, cover_letter: str, profile: dict) -> bool:
         try:
-            await trigger_el.click(timeout=3000)
-            await self._delay(0.4, 0.7)
-            search_input = await self.page.query_selector(
-                "input[class*='select__input'],[class*='select__control'] input,"
-                "[role='combobox'] input,.select2-search__field"
-            )
-            if search_input:
-                try:
-                    await search_input.fill("")
-                    await search_input.type(target, delay=60)
-                    await self._delay(0.5, 0.9)
-                except Exception:
-                    pass
-            option_els = await self.page.query_selector_all(
-                "[class*='select__option']:not([class*='disabled']),"
-                "[role='option']:not([aria-disabled='true']),"
-                ".select2-results__option"
-            )
-            if not option_els:
-                await trigger_el.evaluate("el => el.click()")
-                await self._delay(0.5, 0.8)
-                option_els = await self.page.query_selector_all(
-                    "[class*='select__option'],[role='option']"
+            print(f"[Track {self.track_id}] Filling Greenhouse form...")
+
+            try:
+                await self.page.wait_for_selector(
+                    "form#application_form,#application-form,form[action*='applications']",
+                    timeout=15000
                 )
-            if not option_els:
-                await self.page.keyboard.press("Escape")
-                return False
-            scored_els = []
-            for opt_el in option_els:
-                try:
-                    if not await opt_el.is_visible():
+            except PwTimeout:
+                return await self._ai_page_fallback(job, cover_letter, profile)
+
+            await self._delay(1, 2)
+            await self._dismiss_popups()
+
+            full_name = profile.get("full_name", "") or ""
+            email     = profile.get("email", "") or ""
+            phone     = profile.get("phone", "") or ""
+            linkedin  = profile.get("linkedin_url", "") or ""
+            addr      = profile.get("address", "") or ""
+            first     = full_name.split()[0] if full_name else ""
+            last      = full_name.split()[-1] if len(full_name.split()) > 1 else full_name
+
+            # ── Step 1: Country FIRST — it re-renders the form on selection ──
+            await self._smart_select(
+                "select#country,select[name*='country'],select[id*='country']",
+                "United States"
+            )
+            await self._delay(0.8, 1.2)  # Wait for re-render after country select
+
+            # ── Step 2: State ──
+            state = addr.split(",")[1].strip() if "," in addr else "Indiana"
+            await self._smart_select("select[name*='state'],select[id*='state']", state)
+            await self._delay(0.3, 0.5)
+
+            # ── Step 3: Fill name/email/phone with JS React-safe setter ──
+            # Tries multiple selector patterns for each field
+            for field_selectors, value, label in [
+                (
+                    ["#first_name",
+                     "input[name='job_application[first_name]']",
+                     "input[autocomplete='given-name']",
+                     "input[id*='first'][id*='name']",
+                     "input[placeholder*='First' i]"],
+                    first, "First Name"
+                ),
+                (
+                    ["#last_name",
+                     "input[name='job_application[last_name]']",
+                     "input[autocomplete='family-name']",
+                     "input[id*='last'][id*='name']",
+                     "input[placeholder*='Last' i]"],
+                    last, "Last Name"
+                ),
+                (
+                    ["#email",
+                     "input[name='job_application[email]']",
+                     "input[type='email']",
+                     "input[autocomplete='email']"],
+                    email, "Email"
+                ),
+                (
+                    ["#phone",
+                     "input[name='job_application[phone]']",
+                     "input[type='tel']",
+                     "input[autocomplete='tel']"],
+                    phone, "Phone"
+                ),
+            ]:
+                if not value:
+                    continue
+                filled = False
+                for sel in field_selectors:
+                    if await _js_set_value(self.page, sel, value):
+                        print(f"[Track {self.track_id}] ✓ {label} → {value!r}")
+                        filled = True
+                        break
+                if not filled:
+                    # Fallback: Playwright type
+                    for sel in field_selectors:
+                        try:
+                            el = await self.page.query_selector(sel)
+                            if el and await el.is_visible():
+                                await el.triple_click()
+                                await el.fill(value)
+                                print(f"[Track {self.track_id}] ✓ {label} (fallback) → {value!r}")
+                                filled = True
+                                break
+                        except Exception:
+                            continue
+                await self._delay(0.15, 0.25)
+
+            # ── Step 4: Resume upload ──
+            resume_path = self.store.get("resume_path", "") or ""
+            if resume_path and Path(resume_path).exists():
+                for sel in ["input[type='file']", "#resume", "input[name*='resume']", "input[accept*='pdf']"]:
+                    try:
+                        el = await self.page.query_selector(sel)
+                        if el:
+                            await el.set_input_files(resume_path)
+                            print(f"[Track {self.track_id}] Resume uploaded")
+                            await self._delay(1.5, 2)
+                            break
+                    except Exception:
                         continue
-                    text = (await opt_el.inner_text()).strip()
-                    scored_els.append((opt_el, text, _score_option(text, target)))
+
+            # ── Step 5: Cover letter — click "Enter manually" then fill ──
+            for em_sel in [
+                "a:has-text('Enter manually')",
+                "button:has-text('Enter manually')",
+                "label:has-text('Enter manually')",
+                "span:has-text('Enter manually')",
+            ]:
+                try:
+                    em = await self.page.query_selector(em_sel)
+                    if em and await em.is_visible():
+                        await em.click()
+                        print(f"[Track {self.track_id}] Clicked 'Enter manually'")
+                        await self._delay(0.8, 1.5)
+                        break
                 except Exception:
                     continue
-            if not scored_els:
-                await self.page.keyboard.press("Escape")
-                return False
-            scored_els.sort(key=lambda x: x[2], reverse=True)
-            best_el, best_text, best_score = scored_els[0]
-            if best_score < DROPDOWN_MIN_CONFIDENCE:
-                await self.page.keyboard.press("Escape")
-                return False
-            await best_el.scroll_into_view_if_needed()
-            await best_el.click(timeout=3000)
-            await self._delay(0.3, 0.5)
-            print(f"[Track {self.track_id}] ✓ '{hint}' → '{best_text}' ({best_score:.2f})")
-            return True
-        except Exception:
+
+            cl_filled = False
+            for cl_sel in [
+                "textarea[name*='cover']", "textarea[id*='cover']",
+                "#cover_letter_text", "textarea[aria-label*='cover' i]",
+            ]:
+                if await _js_set_textarea(self.page, cl_sel, cover_letter):
+                    cl_filled = True
+                    break
+            if not cl_filled:
+                for cl_sel in ["textarea[name*='cover']", "textarea[id*='cover']", "#cover_letter_text"]:
+                    try:
+                        el = await self.page.query_selector(cl_sel)
+                        if el and await el.is_visible():
+                            await el.click()
+                            await el.fill(cover_letter)
+                            cl_filled = True
+                            break
+                    except Exception:
+                        continue
+
+            # ── Step 6: LinkedIn ──
+            if linkedin:
+                for sel in [
+                    "input[name*='linkedin']", "input[id*='linkedin']",
+                    "input[placeholder*='LinkedIn' i]",
+                ]:
+                    if await _js_set_value(self.page, sel, linkedin):
+                        break
+
+            # ── Step 7: Universal fill for custom questions / education ──
+            await self._universal_fill(profile, cover_letter)
+
+            # ── Step 8: Force-correct personal fields AFTER universal fill ──
+            # universal_fill may have touched things — this guarantees correctness
+            for field_selectors, value, label in [
+                (["#first_name", "input[name='job_application[first_name]']",
+                  "input[autocomplete='given-name']"], first, "First Name"),
+                (["#last_name",  "input[name='job_application[last_name]']",
+                  "input[autocomplete='family-name']"], last, "Last Name"),
+                (["#email",      "input[name='job_application[email]']",
+                  "input[type='email']"], email, "Email"),
+                (["#phone",      "input[name='job_application[phone]']",
+                  "input[type='tel']"], phone, "Phone"),
+            ]:
+                if not value:
+                    continue
+                for sel in field_selectors:
+                    try:
+                        el = await self.page.query_selector(sel)
+                        if el and await el.is_visible():
+                            current = await el.input_value()
+                            if current != value:
+                                await _js_set_value(self.page, sel, value)
+                                print(f"[Track {self.track_id}] ✓ Corrected {label} → {value!r}")
+                            break
+                    except Exception:
+                        continue
+                await self._delay(0.1, 0.2)
+
+            await self._dismiss_popups()
+            await self._delay(1, 2)
+            return await self._click_submit_and_verify()
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Greenhouse error: {e}")
+            return False
+
+    # ── Lever Form ────────────────────────────────────────────────────────────
+
+    async def _fill_lever(self, job, insight, cover_letter: str, profile: dict) -> bool:
+        try:
+            print(f"[Track {self.track_id}] Filling Lever form...")
+            await self.page.wait_for_selector(
+                "form.application-form,#application-form", timeout=12000
+            )
+            await self._delay(1, 2)
+
+            full_name = profile.get("full_name", "") or ""
+            email     = profile.get("email", "") or ""
+            phone     = profile.get("phone", "") or ""
+
+            for sel, value in [
+                ("input[name='name']",  full_name),
+                ("input[name='email']", email),
+                ("input[name='phone']", phone),
+            ]:
+                await _js_set_value(self.page, sel, value)
+                await self._delay(0.15, 0.25)
+
             try:
-                await self.page.keyboard.press("Escape")
+                ta = await self.page.query_selector("textarea[name*='comments'],textarea")
+                if ta:
+                    await ta.fill(cover_letter)
             except Exception:
                 pass
+
+            resume_path = self.store.get("resume_path", "") or ""
+            if resume_path and Path(resume_path).exists():
+                try:
+                    el = await self.page.query_selector("input[type='file']")
+                    if el:
+                        await el.set_input_files(resume_path)
+                        await self._delay(1, 2)
+                except Exception:
+                    pass
+
+            await self._universal_fill(profile, cover_letter)
+            await self._dismiss_popups()
+            return await self._click_submit_and_verify()
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Lever error: {e}")
+            return False
+
+    # ── Generic Form ──────────────────────────────────────────────────────────
+
+    async def _fill_generic(self, job, insight, cover_letter: str, profile: dict) -> bool:
+        try:
+            print(f"[Track {self.track_id}] Filling generic form: {self.page.url[:60]}")
+
+            # Follow Apply button if on a listing page
+            for btn_sel in [
+                "a:has-text('Apply Now')", "button:has-text('Apply Now')",
+                "a:has-text('Apply for this job')", "a:has-text('Apply for this role')",
+                "button:has-text('Apply for this job')",
+                "a[href*='apply']", "button:has-text('Apply')",
+            ]:
+                try:
+                    btn = await self.page.query_selector(btn_sel)
+                    if not btn or not await btn.is_visible():
+                        continue
+
+                    href = await btn.get_attribute("href") or ""
+                    if href and _detect_ats(href) not in ("generic", "aggregator", ""):
+                        await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
+                        await self._delay(1.5, 2.5)
+                        await self._dismiss_popups()
+                        ats = _detect_ats(self.page.url)
+                        if ats == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        if ats == "lever":
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                        break
+
+                    pages_before = len(self.page.context.pages)
+                    url_before   = self.page.url
+                    await btn.click()
+                    await self._delay(2, 3)
+                    await self._dismiss_popups()
+
+                    pages_after = self.page.context.pages
+                    if len(pages_after) > pages_before:
+                        new_page = pages_after[-1]
+                        try:
+                            await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                        ats = _detect_ats(new_page.url)
+                        if ats == "greenhouse":
+                            self.page = new_page
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        if ats == "lever":
+                            self.page = new_page
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                    break
+                except Exception:
+                    continue
+
+            await self._universal_fill(profile, cover_letter)
+            await self._dismiss_popups()
+            return await self._click_submit_and_verify()
+
+        except Exception as e:
+            print(f"[Track {self.track_id}] Generic error: {e}")
             return False
 
     # ── Universal Form Filler ─────────────────────────────────────────────────
@@ -603,7 +992,7 @@ class TrackWorker:
             filled += await self._fill_custom_dropdowns(fm)
             await self._fill_radios()
             await self._fill_checkboxes()
-            print(f"[Track {self.track_id}] Pass {pass_num+1}: {filled} field(s) filled")
+            print(f"[Track {self.track_id}] Pass {pass_num+1}: {filled} field(s)")
             if filled == 0:
                 break
             await self._delay(0.3, 0.5)
@@ -626,13 +1015,14 @@ class TrackWorker:
         except Exception:
             pass
         first = full_name.split()[0] if full_name else ""
-        last  = full_name.split()[-1] if full_name else ""
+        last  = full_name.split()[-1] if len(full_name.split()) > 1 else full_name
         city  = "West Lafayette"
         state = "Indiana"
         if "," in addr:
             p = [x.strip() for x in addr.split(",")]
             city  = p[0] if p else city
             state = p[1] if len(p) > 1 else state
+
         return {
             "first name": first, "first_name": first, "given name": first,
             "last name": last, "last_name": last, "surname": last, "family name": last,
@@ -680,6 +1070,7 @@ class TrackWorker:
         }
 
     async def _get_label(self, el) -> str:
+        """Extract a readable label for a form element."""
         parts = []
         try:
             el_id = await el.get_attribute("id")
@@ -699,8 +1090,10 @@ class TrackWorker:
         try:
             parent_label = await el.evaluate("""el => {
                 const p = el.closest('.field,.form-group,[class*="field"],[class*="group"]');
-                if (p) { const l = p.querySelector('label,[class*="label"]');
-                         return l ? l.textContent.trim() : ''; }
+                if (p) {
+                    const l = p.querySelector('label,[class*="label"]');
+                    return l ? l.textContent.trim() : '';
+                }
                 return '';
             }""")
             if parent_label:
@@ -710,24 +1103,44 @@ class TrackWorker:
         return " ".join(parts).lower().strip()
 
     def _match(self, label: str, fm: dict) -> str:
+        """
+        Match a field label to a value in the field map.
+        CRITICAL: empty label must return "" immediately.
+        In Python, '' in any_string is always True, which would cause
+        every key to match and return wrong values.
+        """
         label = re.sub(r'[*\(\)]', '', label).strip().lower()
+        # Guard: empty or too-short label — never match
+        if not label or len(label) < 2:
+            return ""
         if label in fm:
             return fm[label]
+        # Substring match — longer keys are more specific
         best_key, best_len = None, 0
         for key in fm:
+            if not key:
+                continue
             if (key in label or label in key) and len(key) > best_len:
                 best_key, best_len = key, len(key)
         if best_key:
             return fm[best_key]
-        lw = set(label.split())
+        # Word overlap — skip tiny words
+        lw = set(w for w in label.split() if len(w) > 2)
+        if not lw:
+            return ""
         best_overlap, best_key = 0, None
         for key in fm:
-            ov = len(lw & set(key.split()))
+            kw = set(w for w in key.split() if len(w) > 2)
+            ov = len(lw & kw)
             if ov > best_overlap:
                 best_overlap, best_key = ov, key
         return fm[best_key] if best_overlap >= 1 and best_key else ""
 
     async def _fill_text_inputs(self, fm: dict) -> int:
+        # These field IDs are filled explicitly by _fill_greenhouse — don't touch
+        PROTECTED_IDS = {
+            "first_name", "last_name", "email", "phone",
+        }
         filled = 0
         for inp in await self.page.query_selector_all(
             "input[type='text'],input[type='email'],input[type='tel'],"
@@ -736,25 +1149,26 @@ class TrackWorker:
             try:
                 if not await inp.is_visible() or await inp.is_disabled():
                     continue
-                current = await inp.input_value()
-                if len(current) > 1:
+                # Skip protected Greenhouse fields
+                inp_id = (await inp.get_attribute("id") or "").replace("-", "_").lower()
+                if inp_id in PROTECTED_IDS:
                     continue
+                inp_name = (await inp.get_attribute("name") or "").lower()
+                if any(p in inp_name for p in ["first_name", "last_name", "[email]", "[phone]"]):
+                    continue
+                # Skip if already filled
+                if len(await inp.input_value()) > 1:
+                    continue
+                # Skip completely unlabelled fields
                 label = await self._get_label(inp)
-                val   = self._match(label, fm)
-                if not val:
+                if not label or len(label) < 2:
                     continue
-                # Safety: never put non-email text into an email field
-                inp_type = (await inp.get_attribute("type") or "").lower()
-                if inp_type == "email" and "@" not in val:
-                    continue
-                # Safety: never put cover letter text into a short field
-                inp_id = (await inp.get_attribute("id") or "").lower()
-                if any(k in inp_id for k in ["first", "last", "name", "phone", "email"]) and len(val) > 100:
-                    continue
-                await inp.triple_click()
-                await inp.fill(val)
-                filled += 1
-                await self._delay(0.1, 0.2)
+                val = self._match(label, fm)
+                if val:
+                    await _js_set_value(self.page, f"#{inp_id}" if inp_id else "", val) or \
+                        await inp.triple_click() or await inp.type(val, delay=30)
+                    filled += 1
+                    await self._delay(0.1, 0.2)
             except Exception:
                 continue
         return filled
@@ -767,7 +1181,10 @@ class TrackWorker:
                     continue
                 if len(await ta.input_value()) > 20:
                     continue
-                val = self._match(await self._get_label(ta), fm) or cover_letter[:800]
+                label = await self._get_label(ta)
+                if not label or len(label) < 2:
+                    continue
+                val = self._match(label, fm) or cover_letter[:800]
                 await ta.click()
                 await ta.fill(val)
                 filled += 1
@@ -782,11 +1199,15 @@ class TrackWorker:
             try:
                 if not await sel_el.is_visible() or await sel_el.is_disabled():
                     continue
-                ct = await sel_el.evaluate("el => el.options[el.selectedIndex]?.text?.trim() || ''")
+                ct = await sel_el.evaluate(
+                    "el => el.options[el.selectedIndex]?.text?.trim() || ''"
+                )
                 if ct.lower() not in ("select...", "select", "please select", "--", ""):
                     continue
                 label = await self._get_label(sel_el)
-                val   = self._match(label, fm)
+                if not label:
+                    continue
+                val = self._match(label, fm)
                 if val:
                     if await self._native_select(sel_el, val, label):
                         filled += 1
@@ -820,9 +1241,14 @@ class TrackWorker:
                     continue
                 label = await ctrl.evaluate("""el => {
                     const c = el.closest('.field,.form-group,[class*="field"],[class*="group"]');
-                    if (c) { const l = c.querySelector('label'); return l ? l.textContent.trim() : ''; }
+                    if (c) {
+                        const l = c.querySelector('label');
+                        return l ? l.textContent.trim() : '';
+                    }
                     return el.getAttribute('aria-label') || '';
                 }""")
+                if not label or len(label) < 2:
+                    continue
                 val = self._match(label.lower().strip(), fm)
                 if val and await self._custom_dropdown(ctrl, val, label):
                     filled += 1
@@ -873,246 +1299,6 @@ class TrackWorker:
             except Exception:
                 continue
 
-    # ── Greenhouse ────────────────────────────────────────────────────────────
-
-    async def _fill_greenhouse(self, job, insight, cover_letter: str, profile: dict) -> bool:
-        try:
-            print(f"[Track {self.track_id}] Filling Greenhouse form...")
-            try:
-                await self.page.wait_for_selector(
-                    "form#application_form,#application-form,form[action*='applications']",
-                    timeout=15000
-                )
-            except PwTimeout:
-                return await self._ai_page_fallback(job, cover_letter, profile)
-
-            await self._delay(1, 2)
-            await self._dismiss_popups()
-
-            full_name = profile.get("full_name", "") or ""
-            email     = profile.get("email", "") or ""
-            phone     = profile.get("phone", "") or ""
-            linkedin  = profile.get("linkedin_url", "") or ""
-            addr      = profile.get("address", "") or ""
-            first     = full_name.split()[0] if full_name else ""
-            last      = full_name.split()[-1] if len(full_name.split()) > 1 else full_name
-
-            print(f"[Track {self.track_id}] Profile: name={full_name!r} email={email!r} phone={phone!r}")
-
-            # Step 1: Country FIRST — selecting it re-renders the form and clears other fields
-            await self._smart_select(
-                "select#country,select[name*='country'],select[id*='country']",
-                "United States"
-            )
-            await self._delay(0.8, 1.2)  # Wait for re-render
-
-            # Step 2: State
-            state = addr.split(",")[1].strip() if "," in addr else "Indiana"
-            await self._smart_select("select[name*='state'],select[id*='state']", state)
-            await self._delay(0.3, 0.5)
-
-            # Step 3: Resume upload
-            resume_path = self.store.get("resume_path", "") or ""
-            if resume_path and Path(resume_path).exists():
-                for sel in ["input[type='file']", "#resume", "input[name*='resume']"]:
-                    try:
-                        el = await self.page.query_selector(sel)
-                        if el:
-                            await el.set_input_files(resume_path)
-                            print(f"[Track {self.track_id}] Resume uploaded")
-                            await self._delay(1.5, 2)
-                            break
-                    except Exception:
-                        continue
-
-            # Step 4: Cover letter — click Enter manually first
-            for em_sel in [
-                "a:has-text('Enter manually')",
-                "button:has-text('Enter manually')",
-                "label:has-text('Enter manually')",
-            ]:
-                try:
-                    em = await self.page.query_selector(em_sel)
-                    if em and await em.is_visible():
-                        await em.click()
-                        print(f"[Track {self.track_id}] Clicked 'Enter manually'")
-                        await self._delay(0.8, 1.5)
-                        break
-                except Exception:
-                    continue
-
-            for cl_sel in ["textarea[name*='cover']", "textarea[id*='cover']", "#cover_letter_text"]:
-                try:
-                    el = await self.page.query_selector(cl_sel)
-                    if el and await el.is_visible():
-                        await el.fill(cover_letter)
-                        break
-                except Exception:
-                    continue
-
-            # Step 5: Universal fill for all other fields (education, custom questions etc.)
-            await self._universal_fill(profile, cover_letter)
-
-            # Step 6: Force-fill personal info LAST so they always have correct values
-            # (country re-render or universal_fill may have put wrong values)
-            named_fields = [
-                ("#first_name", "job_application[first_name]", first,  "First Name"),
-                ("#last_name",  "job_application[last_name]",  last,   "Last Name"),
-                ("#email",      "job_application[email]",      email,  "Email"),
-                ("#phone",      "job_application[phone]",      phone,  "Phone"),
-            ]
-            for id_sel, name_attr, val, label in named_fields:
-                if not val:
-                    continue
-                filled = False
-                # Try by ID first
-                try:
-                    el = await self.page.query_selector(id_sel)
-                    if el and await el.is_visible():
-                        await el.triple_click()
-                        await el.fill(val)
-                        print(f"[Track {self.track_id}] ✓ {label} → {val!r}")
-                        filled = True
-                except Exception:
-                    pass
-                # Fallback: by name attribute
-                if not filled:
-                    try:
-                        el = await self.page.query_selector(f"input[name='{name_attr}']")
-                        if el and await el.is_visible():
-                            await el.triple_click()
-                            await el.fill(val)
-                            print(f"[Track {self.track_id}] ✓ {label} (by name) → {val!r}")
-                    except Exception:
-                        pass
-                await self._delay(0.15, 0.3)
-
-            # LinkedIn
-            if linkedin:
-                await self._fill_input_selector(
-                    "input[name*='linkedin'],input[id*='linkedin'],input[placeholder*='LinkedIn' i]",
-                    linkedin
-                )
-
-            await self._dismiss_popups()
-            await self._delay(1, 2)
-            return await self._click_submit_and_verify()
-
-        except Exception as e:
-            print(f"[Track {self.track_id}] Greenhouse error: {e}")
-            return False
-
-    async def _fill_lever(self, job, insight, cover_letter: str, profile: dict) -> bool:
-        try:
-            print(f"[Track {self.track_id}] Filling Lever form...")
-            await self.page.wait_for_selector(
-                "form.application-form,#application-form", timeout=12000
-            )
-            await self._delay(1, 2)
-            full_name = profile.get("full_name", "") or ""
-            for sel, val in [
-                ("input[name='name']",  full_name),
-                ("input[name='email']", profile.get("email", "")),
-                ("input[name='phone']", profile.get("phone", "")),
-            ]:
-                await self._fill_input_selector(sel, val)
-            try:
-                ta = await self.page.query_selector("textarea[name*='comments'],textarea")
-                if ta:
-                    await ta.fill(cover_letter)
-            except Exception:
-                pass
-            resume_path = self.store.get("resume_path", "") or ""
-            if resume_path and Path(resume_path).exists():
-                try:
-                    el = await self.page.query_selector("input[type='file']")
-                    if el:
-                        await el.set_input_files(resume_path)
-                        await self._delay(1, 2)
-                except Exception:
-                    pass
-            await self._universal_fill(profile, cover_letter)
-            await self._dismiss_popups()
-            return await self._click_submit_and_verify()
-        except Exception as e:
-            print(f"[Track {self.track_id}] Lever error: {e}")
-            return False
-
-    async def _fill_generic(self, job, insight, cover_letter: str, profile: dict) -> bool:
-        try:
-            print(f"[Track {self.track_id}] Filling generic form: {self.page.url[:60]}")
-
-            # Check if this is a job listing page (not an application form)
-            # Look for an Apply button that leads to the real form
-            for btn_sel in [
-                "a:has-text('Apply Now')", "button:has-text('Apply Now')",
-                "a:has-text('Apply for this job')", "a:has-text('Apply for this role')",
-                "a:has-text('Apply for this position')",
-                "button:has-text('Apply for this job')",
-                "a[href*='apply']", "button:has-text('Apply')",
-            ]:
-                try:
-                    btn = await self.page.query_selector(btn_sel)
-                    if not btn or not await btn.is_visible():
-                        continue
-                    # Check if href leads to a known ATS
-                    href = await btn.get_attribute("href") or ""
-                    if href and _detect_ats(href) not in ("generic", "aggregator", ""):
-                        await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
-                        await self._delay(1.5, 2.5)
-                        await self._dismiss_popups()
-                        new_ats = _detect_ats(self.page.url)
-                        if new_ats == "greenhouse":
-                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                        elif new_ats == "lever":
-                            return await self._fill_lever(job, insight, cover_letter, profile)
-                        break
-                    # Otherwise click and check for navigation or new tab
-                    pages_before = len(self.page.context.pages)
-                    url_before = self.page.url
-                    await btn.click()
-                    await self._delay(2, 3)
-                    await self._dismiss_popups()
-                    # New tab?
-                    pages_after = self.page.context.pages
-                    if len(pages_after) > pages_before:
-                        new_page = pages_after[-1]
-                        try:
-                            await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        except Exception:
-                            pass
-                        new_ats = _detect_ats(new_page.url)
-                        if new_ats == "greenhouse":
-                            self.page = new_page
-                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                        elif new_ats == "lever":
-                            self.page = new_page
-                            return await self._fill_lever(job, insight, cover_letter, profile)
-                    break
-                except Exception:
-                    continue
-
-            await self._universal_fill(profile, cover_letter)
-            await self._dismiss_popups()
-            return await self._click_submit_and_verify()
-        except Exception as e:
-            print(f"[Track {self.track_id}] Generic error: {e}")
-            return False
-
-    async def _fill_input_selector(self, selector: str, value: str) -> bool:
-        if not value:
-            return False
-        for sel in selector.split(","):
-            try:
-                el = await self.page.query_selector(sel.strip())
-                if el and await el.is_visible():
-                    await el.triple_click()
-                    await el.type(value, delay=30)
-                    return True
-            except Exception:
-                continue
-        return False
-
     # ── AI Fallback ───────────────────────────────────────────────────────────
 
     async def _ai_page_fallback(self, job, cover_letter: str, profile: dict) -> bool:
@@ -1127,7 +1313,9 @@ class TrackWorker:
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 400,
                     "messages": [{"role": "user", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": b64
+                        }},
                         {"type": "text", "text": (
                             f"Job application page at {self.page.url}. What is blocking the form? "
                             'Reply ONLY JSON: {"obstacle":"description","selector":"css","action":"click"}'
@@ -1160,16 +1348,17 @@ class TrackWorker:
         for _step in range(10):
             await self._dismiss_popups()
 
+            # False positive URL guard
             for fp in FALSE_POSITIVE_URLS:
                 if fp in self.page.url:
                     print(f"[Track {self.track_id}] False positive URL — not submitting")
                     return False
 
+            # Check for confirmation
             try:
                 page_text = (await self.page.inner_text("body")).lower()
             except Exception:
                 page_text = ""
-
             for phrase in CONFIRMATION_PHRASES:
                 if phrase in page_text:
                     print(f"[Track {self.track_id}] ✅ Confirmed: '{phrase}'")
@@ -1179,6 +1368,7 @@ class TrackWorker:
                     print(f"[Track {self.track_id}] ✅ Confirmation URL")
                     return True
 
+            # Find submit button
             submit_btn = None
             for btn_sel in [
                 "button[type='submit']", "input[type='submit']",
@@ -1196,11 +1386,12 @@ class TrackWorker:
 
             if submit_btn:
                 text = (await submit_btn.inner_text()).strip()
-                print(f"[Track {self.track_id}] Clicking: '{text}'")
+                print(f"[Track {self.track_id}] Clicking submit: '{text}'")
                 await submit_btn.click()
                 await self._delay(2.5, 4)
                 continue
 
+            # Multi-step: find Next button
             next_clicked = False
             for next_sel in [
                 "button:has-text('Next')", "button:has-text('Continue')", "a:has-text('Next')"
