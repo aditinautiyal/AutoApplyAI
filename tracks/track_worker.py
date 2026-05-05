@@ -97,9 +97,19 @@ CONFIRMATION_PHRASES = [
 FALSE_POSITIVE_URLS = [
     "stripe.com/jobs/search",
     "simplyhired.com",
-    "indeed.com",
+    "smartapply.indeed.com",   # Indeed SmartApply requires login — skip
+    "indeed.com/apply",        # Indeed apply requires login — skip
     "linkedin.com/jobs",
     "glassdoor.com",
+]
+
+# URLs that should be skipped in aggregator link scan (require login/account)
+AGGREGATOR_SKIP_URLS = [
+    "smartapply.indeed.com",
+    "indeed.com/apply",
+    "linkedin.com",
+    "glassdoor.com",
+    "ziprecruiter.com",
 ]
 
 POPUP_SELECTORS = [
@@ -110,21 +120,40 @@ POPUP_SELECTORS = [
     "button:has-text('Accept All')",
     "button:has-text('Accept Cookies')",
     "button:has-text('I Accept')",
+    "button:has-text('I Agree')",
     "button:has-text('I agree')",
+    "button:has-text('Agree and proceed')",
     "button:has-text('Agree')",
     "button:has-text('Allow all')",
+    "button:has-text('Allow All')",
+    "button:has-text('Allow cookies')",
     "button:has-text('OK')",
+    "button:has-text('Ok')",
     "button:has-text('Got it')",
+    "button:has-text('Got It')",
     "button:has-text('Dismiss')",
     "button:has-text('Close')",
+    "button:has-text('Continue')",
+    "button:has-text('Proceed')",
     "[id*='cookie'] button:has-text('Accept')",
     "[class*='cookie'] button:has-text('Accept')",
+    "[id*='cookie'] button:has-text('Allow')",
+    "[class*='cookie'] button:has-text('Allow')",
     "[id*='consent'] button:has-text('Accept')",
+    "[class*='consent'] button:has-text('Accept')",
     "[id*='gdpr'] button:not(:has-text('Reject'))",
+    "[class*='gdpr'] button:not(:has-text('Reject'))",
+    "[id*='banner'] button:has-text('Accept')",
+    "[class*='banner'] button:has-text('Accept')",
+    "[class*='CookieBanner'] button",
+    "[class*='cookie-banner'] button",
     "button[aria-label='Close']",
     "button[aria-label='close']",
+    "button[aria-label='Dismiss']",
     ".modal-close",
     "[data-dismiss='modal']",
+    "[data-testid='cookie-accept']",
+    "[data-testid='consent-accept']",
 ]
 
 DROPDOWN_MIN_CONFIDENCE = 0.45
@@ -429,7 +458,12 @@ class TrackWorker:
                     .map(a => a.href)
                     .filter(h => h && h.startsWith('http'))
             """)
-            ats_hrefs = [h for h in all_hrefs if _detect_ats(h) not in ("aggregator", "generic")]
+            # Filter out login-required aggregator URLs
+            ats_hrefs = [
+                h for h in all_hrefs
+                if _detect_ats(h) not in ("aggregator", "generic")
+                and not any(skip in h for skip in AGGREGATOR_SKIP_URLS)
+            ]
             if ats_hrefs:
                 target = ats_hrefs[0]
                 ats_type = _detect_ats(target)
@@ -716,8 +750,9 @@ class TrackWorker:
             await self._smart_select("select[name*='state'],select[id*='state']", state)
             await self._delay(0.3, 0.5)
 
-            # ── Step 3: Fill name/email/phone with JS React-safe setter ──
-            # Tries multiple selector patterns for each field
+            # ── Step 3: Fill name/email/phone ──
+            # Uses Playwright click+fill as primary (triggers all React events via keyboard),
+            # JS setter as fallback
             for field_selectors, value, label in [
                 (
                     ["#first_name",
@@ -754,23 +789,30 @@ class TrackWorker:
                     continue
                 filled = False
                 for sel in field_selectors:
-                    if await _js_set_value(self.page, sel, value):
-                        print(f"[Track {self.track_id}] ✓ {label} → {value!r}")
-                        filled = True
-                        break
-                if not filled:
-                    # Fallback: Playwright type
-                    for sel in field_selectors:
-                        try:
-                            el = await self.page.query_selector(sel)
-                            if el and await el.is_visible():
-                                await el.triple_click()
-                                await el.fill(value)
-                                print(f"[Track {self.track_id}] ✓ {label} (fallback) → {value!r}")
+                    try:
+                        el = await self.page.query_selector(sel)
+                        if el and await el.is_visible():
+                            # Primary: click to focus, select all, type
+                            await el.click()
+                            await self._delay(0.1, 0.2)
+                            await el.press("Control+a")
+                            await el.press("Delete")
+                            await el.type(value, delay=40)
+                            await el.press("Tab")  # trigger blur/change events
+                            actual = await el.input_value()
+                            if actual.strip():
+                                print(f"[Track {self.track_id}] ✓ {label} → {actual!r}")
                                 filled = True
                                 break
-                        except Exception:
-                            continue
+                    except Exception:
+                        continue
+                if not filled:
+                    # Fallback: JS setter
+                    for sel in field_selectors:
+                        if await _js_set_value(self.page, sel, value):
+                            print(f"[Track {self.track_id}] ✓ {label} (JS) → {value!r}")
+                            filled = True
+                            break
                 await self._delay(0.15, 0.25)
 
             # ── Step 4: Resume upload ──
@@ -837,16 +879,15 @@ class TrackWorker:
             await self._universal_fill(profile, cover_letter)
 
             # ── Step 8: Force-correct personal fields AFTER universal fill ──
-            # universal_fill may have touched things — this guarantees correctness
             for field_selectors, value, label in [
                 (["#first_name", "input[name='job_application[first_name]']",
-                  "input[autocomplete='given-name']"], first, "First Name"),
+                  "input[autocomplete='given-name']", "input[placeholder*='First' i]"], first, "First Name"),
                 (["#last_name",  "input[name='job_application[last_name]']",
-                  "input[autocomplete='family-name']"], last, "Last Name"),
+                  "input[autocomplete='family-name']", "input[placeholder*='Last' i]"], last, "Last Name"),
                 (["#email",      "input[name='job_application[email]']",
-                  "input[type='email']"], email, "Email"),
+                  "input[type='email']", "input[autocomplete='email']"], email, "Email"),
                 (["#phone",      "input[name='job_application[phone]']",
-                  "input[type='tel']"], phone, "Phone"),
+                  "input[type='tel']", "input[autocomplete='tel']"], phone, "Phone"),
             ]:
                 if not value:
                     continue
@@ -855,8 +896,13 @@ class TrackWorker:
                         el = await self.page.query_selector(sel)
                         if el and await el.is_visible():
                             current = await el.input_value()
-                            if current != value:
-                                await _js_set_value(self.page, sel, value)
+                            if current.strip() != value.strip():
+                                await el.click()
+                                await self._delay(0.1, 0.15)
+                                await el.press("Control+a")
+                                await el.press("Delete")
+                                await el.type(value, delay=40)
+                                await el.press("Tab")
                                 print(f"[Track {self.track_id}] ✓ Corrected {label} → {value!r}")
                             break
                     except Exception:
@@ -923,6 +969,31 @@ class TrackWorker:
     async def _fill_generic(self, job, insight, cover_letter: str, profile: dict) -> bool:
         try:
             print(f"[Track {self.track_id}] Filling generic form: {self.page.url[:60]}")
+
+            # Stripe apply pages embed a Greenhouse form in an iframe — switch to it
+            if "stripe.com/jobs" in self.page.url:
+                try:
+                    frame = None
+                    for f in self.page.frames:
+                        if "greenhouse.io" in f.url or "grnh.se" in f.url:
+                            frame = f
+                            break
+                    if not frame:
+                        # Try navigating to the embedded apply URL
+                        apply_links = await self.page.evaluate("""() =>
+                            Array.from(document.querySelectorAll('a[href]'))
+                                .map(a => a.href)
+                                .filter(h => h.includes('greenhouse') || h.includes('grnh.se'))
+                        """)
+                        if apply_links:
+                            await self.page.goto(apply_links[0], timeout=30000, wait_until="domcontentloaded")
+                            await self._delay(1.5, 2)
+                            await self._dismiss_popups()
+                            if _detect_ats(self.page.url) == "greenhouse":
+                                return await self._fill_greenhouse(job, insight, cover_letter,
+                                                                   self.store.get_profile() or {})
+                except Exception as e:
+                    print(f"[Track {self.track_id}] Stripe frame check: {e}")
 
             # Follow Apply button if on a listing page
             for btn_sel in [
@@ -1067,6 +1138,60 @@ class TrackWorker:
             "ethnicity": "Prefer not to say", "veteran": "No", "disability": "No",
             "salary": "25", "expected salary": "25", "hourly rate": "25",
             "start date": "May 2026", "available": "May 2026",
+
+            # Work experience questions
+            "current or previous employer": "AnautAI",
+            "employer": "AnautAI",
+            "company name": "AnautAI",
+            "current or previous job title": "Software Engineer",
+            "job title": "Software Engineer",
+            "current title": "Software Engineer",
+            "previous title": "Software Engineer",
+
+            # Years of experience — default to 0-1 / Less than 1 year
+            "years of experience": "0-1",
+            "years experience": "0-1",
+            "how many years": "0-1",
+            "experience with typescript": "0-1",
+            "experience with javascript": "1-2",
+            "experience with python": "1-2",
+            "experience with java": "0-1",
+            "experience with c#": "0-1",
+            "experience with c++": "0-1",
+            "experience with sql": "0-1",
+            "experience with react": "0-1",
+            "typescript": "0-1",
+            "javascript": "1-2",
+            "python": "1-2",
+
+            # Location/commute questions
+            "commuting distance": "No",
+            "reside within commuting": "No",
+            "currently reside": "No",
+            "work from our office": "Yes",
+            "willing to work": "Yes",
+            "work minimum": "Yes",
+            "days per week": "Yes",
+            "hybrid": "Yes",
+            "on site": "Yes",
+            "onsite": "Yes",
+
+            # Consent/agreement questions
+            "brighthire": "Yes, I consent",
+            "consent": "Yes, I consent",
+            "agree to": "Yes",
+            "background check": "Yes",
+            "drug test": "Yes",
+            "terms of service": "Yes",
+
+            # EEO/demographic
+            "hispanic or latino": "No",
+            "american indian": "No",
+            "asian": "Yes",
+            "black or african": "No",
+            "native hawaiian": "No",
+            "white": "No",
+            "two or more": "No",
         }
 
     async def _get_label(self, el) -> str:
