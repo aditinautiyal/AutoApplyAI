@@ -62,7 +62,7 @@ def _get_current_ip() -> str:
 
 
 def _is_blocked(content: str, status_code: int) -> bool:
-    if status_code in (403, 429, 503):
+    if status_code in (403, 429, 503, 999):
         return True
     cl = content.lower()
     return any(s in cl for s in BLOCK_SIGNATURES)

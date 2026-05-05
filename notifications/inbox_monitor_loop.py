@@ -27,7 +27,7 @@ class InboxMonitorLoop:
 
     def start(self):
         """Start monitoring in background thread."""
-        gmail_token = self.store.get("gmail_token")
+        gmail_token = self.store.get("gmail_token") if self.store else None
         if not gmail_token:
             print("[InboxMonitor] Gmail not connected — skipping inbox monitoring")
             return
@@ -73,3 +73,4 @@ class InboxMonitorLoop:
             "running": self.running,
             "last_check": self.last_check,
         }
+
