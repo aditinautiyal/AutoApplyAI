@@ -362,6 +362,7 @@ class TrackWorker:
 
     async def _handle_aggregator(self, job, insight, cover_letter: str, profile: dict) -> bool:
         print(f"[Track {self.track_id}] Aggregator — finding Apply button...")
+        _seen_urls: set[str] = set()  # Prevent infinite tab loops
         apply_selectors = [
             "a[href*='greenhouse.io']",
             "a[href*='lever.co']",
@@ -387,8 +388,15 @@ class TrackWorker:
                     await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
                     await self._delay(1.5, 2.5)
                     await self._dismiss_popups()
-                    if _detect_ats(self.page.url) not in ("aggregator",):
-                        return await self._apply(job, insight, cover_letter)
+                    new_ats = _detect_ats(self.page.url)
+                    if new_ats not in ("aggregator",):
+                        profile = self.store.get_profile() or {}
+                        if new_ats == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        elif new_ats == "lever":
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                        else:
+                            return await self._fill_generic(job, insight, cover_letter, profile)
                     continue
 
                 # Listen for new tab
@@ -399,15 +407,33 @@ class TrackWorker:
                     await new_page.wait_for_load_state("domcontentloaded", timeout=15000)
                     new_ats = _detect_ats(new_page.url)
                     print(f"[Track {self.track_id}] New tab: {new_page.url[:60]} → {new_ats}")
+                    if new_page.url in _seen_urls:
+                        await new_page.close()
+                        continue
+                    _seen_urls.add(new_page.url)
                     if new_ats not in ("aggregator", "generic"):
                         self.page = new_page
                         await self._dismiss_popups()
-                        return await self._apply(job, insight, cover_letter)
+                        profile = self.store.get_profile() or {}
+                        # Call filler DIRECTLY — do NOT call _apply() or it re-navigates to SimplyHired
+                        if new_ats == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        elif new_ats == "lever":
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                        else:
+                            return await self._fill_generic(job, insight, cover_letter, profile)
                     await new_page.close()
                 except PwTimeout:
                     await self._delay(2, 3)
-                    if _detect_ats(self.page.url) not in ("aggregator", "generic"):
-                        return await self._apply(job, insight, cover_letter)
+                    new_ats = _detect_ats(self.page.url)
+                    if new_ats not in ("aggregator", "generic"):
+                        profile = self.store.get_profile() or {}
+                        if new_ats == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        elif new_ats == "lever":
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                        else:
+                            return await self._fill_generic(job, insight, cover_letter, profile)
 
             except Exception:
                 continue
