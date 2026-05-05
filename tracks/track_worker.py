@@ -362,60 +362,87 @@ class TrackWorker:
 
     async def _handle_aggregator(self, job, insight, cover_letter: str, profile: dict) -> bool:
         print(f"[Track {self.track_id}] Aggregator — finding Apply button...")
-        _seen_urls: set[str] = set()  # Prevent infinite tab loops
+        profile = self.store.get_profile() or {}
+
+        # ── Strategy 1: Scan ALL links on page for direct ATS URLs (no clicking needed) ──
+        try:
+            all_links = await self.page.evaluate("""() => {
+                return Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => a.href)
+                    .filter(h => h && h.startsWith('http'));
+            }""")
+            ats_links = [h for h in all_links if _detect_ats(h) not in ("aggregator", "generic")]
+            if ats_links:
+                best = ats_links[0]
+                ats_type = _detect_ats(best)
+                print(f"[Track {self.track_id}] Found ATS link in page: {best[:70]} → {ats_type}")
+                await self.page.goto(best, timeout=30000, wait_until="domcontentloaded")
+                await self._delay(1.5, 2.5)
+                await self._dismiss_popups()
+                if ats_type == "greenhouse":
+                    return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                elif ats_type == "lever":
+                    return await self._fill_lever(job, insight, cover_letter, profile)
+                else:
+                    return await self._fill_generic(job, insight, cover_letter, profile)
+        except Exception as e:
+            print(f"[Track {self.track_id}] Link scan error: {e}")
+
+        # ── Strategy 2: Click Apply button and catch new tab OR same-page navigation ──
         apply_selectors = [
-            "a[href*='greenhouse.io']",
-            "a[href*='lever.co']",
-            "a[href*='ashbyhq.com']",
-            "a[href*='workday']",
-            "button:has-text('Apply Now')",
             "a:has-text('Apply Now')",
+            "button:has-text('Apply Now')",
             "a:has-text('Apply on company site')",
             "a:has-text('Apply on Company Site')",
-            "button:has-text('Easy Apply')",
+            "a:has-text('Apply now')",
+            "button:has-text('Apply now')",
             "[data-testid*='apply']",
+            "a:has-text('Apply')",
+            "button:has-text('Apply')",
         ]
+
         for sel in apply_selectors:
             try:
                 btn = await self.page.query_selector(sel)
                 if not btn or not await btn.is_visible():
                     continue
 
-                # Direct ATS link — just navigate
+                # Check href first — navigate directly without clicking if it's an ATS link
                 href = await btn.get_attribute("href") or ""
                 if href and _detect_ats(href) not in ("aggregator", "generic", ""):
-                    print(f"[Track {self.track_id}] Direct ATS link: {href[:60]}")
+                    print(f"[Track {self.track_id}] Direct ATS href: {href[:70]}")
                     await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
                     await self._delay(1.5, 2.5)
                     await self._dismiss_popups()
                     new_ats = _detect_ats(self.page.url)
-                    if new_ats not in ("aggregator",):
-                        profile = self.store.get_profile() or {}
-                        if new_ats == "greenhouse":
-                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
-                        elif new_ats == "lever":
-                            return await self._fill_lever(job, insight, cover_letter, profile)
-                        else:
-                            return await self._fill_generic(job, insight, cover_letter, profile)
+                    if new_ats == "greenhouse":
+                        return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                    elif new_ats == "lever":
+                        return await self._fill_lever(job, insight, cover_letter, profile)
+                    elif new_ats not in ("aggregator",):
+                        return await self._fill_generic(job, insight, cover_letter, profile)
                     continue
 
-                # Listen for new tab
-                try:
-                    async with self.page.context.expect_page(timeout=5000) as new_page_info:
-                        await btn.click()
-                    new_page = await new_page_info.value
-                    await new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    new_ats = _detect_ats(new_page.url)
-                    print(f"[Track {self.track_id}] New tab: {new_page.url[:60]} → {new_ats}")
-                    if new_page.url in _seen_urls:
-                        await new_page.close()
-                        continue
-                    _seen_urls.add(new_page.url)
+                # Click and watch for new tab (with short timeout)
+                url_before = self.page.url
+                pages_before = len(self.page.context.pages)
+                await btn.click()
+                await self._delay(2, 3)
+
+                # Check if a new tab opened
+                pages_after = self.page.context.pages
+                if len(pages_after) > pages_before:
+                    new_page = pages_after[-1]
+                    try:
+                        await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    new_url = new_page.url
+                    new_ats = _detect_ats(new_url)
+                    print(f"[Track {self.track_id}] New tab: {new_url[:70]} → {new_ats}")
                     if new_ats not in ("aggregator", "generic"):
                         self.page = new_page
                         await self._dismiss_popups()
-                        profile = self.store.get_profile() or {}
-                        # Call filler DIRECTLY — do NOT call _apply() or it re-navigates to SimplyHired
                         if new_ats == "greenhouse":
                             return await self._fill_greenhouse(job, insight, cover_letter, profile)
                         elif new_ats == "lever":
@@ -423,11 +450,12 @@ class TrackWorker:
                         else:
                             return await self._fill_generic(job, insight, cover_letter, profile)
                     await new_page.close()
-                except PwTimeout:
-                    await self._delay(2, 3)
+
+                # Check if same page navigated
+                if self.page.url != url_before:
                     new_ats = _detect_ats(self.page.url)
                     if new_ats not in ("aggregator", "generic"):
-                        profile = self.store.get_profile() or {}
+                        await self._dismiss_popups()
                         if new_ats == "greenhouse":
                             return await self._fill_greenhouse(job, insight, cover_letter, profile)
                         elif new_ats == "lever":
@@ -708,14 +736,25 @@ class TrackWorker:
             try:
                 if not await inp.is_visible() or await inp.is_disabled():
                     continue
-                if len(await inp.input_value()) > 1:
+                current = await inp.input_value()
+                if len(current) > 1:
                     continue
-                val = self._match(await self._get_label(inp), fm)
-                if val:
-                    await inp.triple_click()
-                    await inp.type(val, delay=30)
-                    filled += 1
-                    await self._delay(0.1, 0.2)
+                label = await self._get_label(inp)
+                val   = self._match(label, fm)
+                if not val:
+                    continue
+                # Safety: never put non-email text into an email field
+                inp_type = (await inp.get_attribute("type") or "").lower()
+                if inp_type == "email" and "@" not in val:
+                    continue
+                # Safety: never put cover letter text into a short field
+                inp_id = (await inp.get_attribute("id") or "").lower()
+                if any(k in inp_id for k in ["first", "last", "name", "phone", "email"]) and len(val) > 100:
+                    continue
+                await inp.triple_click()
+                await inp.fill(val)
+                filled += 1
+                await self._delay(0.1, 0.2)
             except Exception:
                 continue
         return filled
@@ -854,24 +893,25 @@ class TrackWorker:
             email     = profile.get("email", "") or ""
             phone     = profile.get("phone", "") or ""
             linkedin  = profile.get("linkedin_url", "") or ""
+            addr      = profile.get("address", "") or ""
+            first     = full_name.split()[0] if full_name else ""
+            last      = full_name.split()[-1] if len(full_name.split()) > 1 else full_name
 
-            for sel, val in [
-                ("#first_name,input[name='job_application[first_name]']", full_name.split()[0] if full_name else ""),
-                ("#last_name,input[name='job_application[last_name]']",   full_name.split()[-1] if full_name else ""),
-                ("#email,input[name='job_application[email]']",           email),
-                ("#phone,input[name='job_application[phone]']",           phone),
-            ]:
-                await self._fill_input_selector(sel, val)
-                await self._delay(0.15, 0.3)
+            print(f"[Track {self.track_id}] Profile: name={full_name!r} email={email!r} phone={phone!r}")
 
+            # Step 1: Country FIRST — selecting it re-renders the form and clears other fields
             await self._smart_select(
                 "select#country,select[name*='country'],select[id*='country']",
                 "United States"
             )
-            addr  = profile.get("address", "") or ""
+            await self._delay(0.8, 1.2)  # Wait for re-render
+
+            # Step 2: State
             state = addr.split(",")[1].strip() if "," in addr else "Indiana"
             await self._smart_select("select[name*='state'],select[id*='state']", state)
+            await self._delay(0.3, 0.5)
 
+            # Step 3: Resume upload
             resume_path = self.store.get("resume_path", "") or ""
             if resume_path and Path(resume_path).exists():
                 for sel in ["input[type='file']", "#resume", "input[name*='resume']"]:
@@ -885,6 +925,7 @@ class TrackWorker:
                     except Exception:
                         continue
 
+            # Step 4: Cover letter — click Enter manually first
             for em_sel in [
                 "a:has-text('Enter manually')",
                 "button:has-text('Enter manually')",
@@ -909,13 +950,50 @@ class TrackWorker:
                 except Exception:
                     continue
 
+            # Step 5: Universal fill for all other fields (education, custom questions etc.)
+            await self._universal_fill(profile, cover_letter)
+
+            # Step 6: Force-fill personal info LAST so they always have correct values
+            # (country re-render or universal_fill may have put wrong values)
+            named_fields = [
+                ("#first_name", "job_application[first_name]", first,  "First Name"),
+                ("#last_name",  "job_application[last_name]",  last,   "Last Name"),
+                ("#email",      "job_application[email]",      email,  "Email"),
+                ("#phone",      "job_application[phone]",      phone,  "Phone"),
+            ]
+            for id_sel, name_attr, val, label in named_fields:
+                if not val:
+                    continue
+                filled = False
+                # Try by ID first
+                try:
+                    el = await self.page.query_selector(id_sel)
+                    if el and await el.is_visible():
+                        await el.triple_click()
+                        await el.fill(val)
+                        print(f"[Track {self.track_id}] ✓ {label} → {val!r}")
+                        filled = True
+                except Exception:
+                    pass
+                # Fallback: by name attribute
+                if not filled:
+                    try:
+                        el = await self.page.query_selector(f"input[name='{name_attr}']")
+                        if el and await el.is_visible():
+                            await el.triple_click()
+                            await el.fill(val)
+                            print(f"[Track {self.track_id}] ✓ {label} (by name) → {val!r}")
+                    except Exception:
+                        pass
+                await self._delay(0.15, 0.3)
+
+            # LinkedIn
             if linkedin:
                 await self._fill_input_selector(
                     "input[name*='linkedin'],input[id*='linkedin'],input[placeholder*='LinkedIn' i]",
                     linkedin
                 )
 
-            await self._universal_fill(profile, cover_letter)
             await self._dismiss_popups()
             await self._delay(1, 2)
             return await self._click_submit_and_verify()
@@ -963,19 +1041,57 @@ class TrackWorker:
     async def _fill_generic(self, job, insight, cover_letter: str, profile: dict) -> bool:
         try:
             print(f"[Track {self.track_id}] Filling generic form: {self.page.url[:60]}")
+
+            # Check if this is a job listing page (not an application form)
+            # Look for an Apply button that leads to the real form
             for btn_sel in [
                 "a:has-text('Apply Now')", "button:has-text('Apply Now')",
-                "button:has-text('Apply')",
+                "a:has-text('Apply for this job')", "a:has-text('Apply for this role')",
+                "a:has-text('Apply for this position')",
+                "button:has-text('Apply for this job')",
+                "a[href*='apply']", "button:has-text('Apply')",
             ]:
                 try:
                     btn = await self.page.query_selector(btn_sel)
-                    if btn and await btn.is_visible():
-                        await btn.click()
-                        await self._delay(2, 3)
+                    if not btn or not await btn.is_visible():
+                        continue
+                    # Check if href leads to a known ATS
+                    href = await btn.get_attribute("href") or ""
+                    if href and _detect_ats(href) not in ("generic", "aggregator", ""):
+                        await self.page.goto(href, timeout=30000, wait_until="domcontentloaded")
+                        await self._delay(1.5, 2.5)
                         await self._dismiss_popups()
+                        new_ats = _detect_ats(self.page.url)
+                        if new_ats == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        elif new_ats == "lever":
+                            return await self._fill_lever(job, insight, cover_letter, profile)
                         break
+                    # Otherwise click and check for navigation or new tab
+                    pages_before = len(self.page.context.pages)
+                    url_before = self.page.url
+                    await btn.click()
+                    await self._delay(2, 3)
+                    await self._dismiss_popups()
+                    # New tab?
+                    pages_after = self.page.context.pages
+                    if len(pages_after) > pages_before:
+                        new_page = pages_after[-1]
+                        try:
+                            await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except Exception:
+                            pass
+                        new_ats = _detect_ats(new_page.url)
+                        if new_ats == "greenhouse":
+                            self.page = new_page
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        elif new_ats == "lever":
+                            self.page = new_page
+                            return await self._fill_lever(job, insight, cover_letter, profile)
+                    break
                 except Exception:
                     continue
+
             await self._universal_fill(profile, cover_letter)
             await self._dismiss_popups()
             return await self._click_submit_and_verify()
