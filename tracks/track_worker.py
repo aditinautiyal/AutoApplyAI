@@ -169,9 +169,10 @@ def _score_option(option_text: str, target: str) -> float:
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
 class TrackWorker:
-    def __init__(self, track_id: int, status_cb=None, log_cb=None):
+    def __init__(self, track_id: int, stop_event=None, status_callback=None, status_cb=None, log_cb=None):
         self.track_id  = track_id
-        self.status_cb = status_cb or (lambda *a: None)
+        self._stop_event = stop_event
+        self.status_cb = status_callback or status_cb or (lambda *a: None)
         self.log_cb    = log_cb    or (lambda *a: None)
         self.page: Page | None = None
         self._context  = None
@@ -207,8 +208,15 @@ class TrackWorker:
     def stop(self):
         self._stop = True
 
+    def _should_stop(self) -> bool:
+        if self._stop:
+            return True
+        if self._stop_event and self._stop_event.is_set():
+            return True
+        return False
+
     async def run(self):
-        while not self._stop:
+        while not self._should_stop():
             try:
                 if not self.page or self.page.is_closed():
                     await self._close_browser()
