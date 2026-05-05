@@ -24,11 +24,11 @@ import httpx
 from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeout
 
 from core.settings_store import get_store
-from discovery.job_pool import get_pool, JobStatus
+from discovery.job_pool import get_pool
 from tracks.cover_letter_gen import generate_cover_letter
-from tracks.humanizer_check import check_humanizer
+from tracks.humanizer_check import ensure_humanized
 from research.company_researcher import research_company
-from research.insight_synthesizer import synthesize_insight
+from research.insight_synthesizer import synthesize
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -223,31 +223,29 @@ class TrackWorker:
                 print(f"[Track {self.track_id}] ► {job.title} @ {job.company}")
 
                 try:
-                    insight = await asyncio.wait_for(
-                        research_company(job.company, job.description), timeout=90
+                    research = await asyncio.wait_for(
+                        research_company(job.company, job.title, job.description), timeout=90
                     )
+                    insight = synthesize(research)
                     cl = await generate_cover_letter(job, insight)
-                    ok, score = await check_humanizer(cl)
-                    print(f"[Humanizer] AI score {score:.2f}, threshold 0.75")
-                    if not ok:
-                        cl = await generate_cover_letter(job, insight, retry=True)
+                    cl, ai_score, attempts = ensure_humanized(cl, job.company, job.title)
+                    print(f"[Humanizer] AI score {ai_score:.2f} after {attempts} attempt(s)")
 
                     success = await self._apply(job, insight, cl)
-                    status  = JobStatus.SUBMITTED if success else JobStatus.FAILED
 
                     if success:
                         print(f"[Track {self.track_id}] ✅ CONFIRMED SUBMISSION: {job.title} @ {job.company}")
+                        self.pool.mark_done(job.job_id, "submitted")
                     else:
                         print(f"[Track {self.track_id}] ✗ Failed: {job.title} @ {job.company} — will retry next cycle")
-
-                    self.pool.mark(job.job_id, status, cover_letter=cl)
+                        self.pool.mark_done(job.job_id, "failed")
 
                 except asyncio.TimeoutError:
                     print(f"[Track {self.track_id}] Timeout — {job.company}")
-                    self.pool.mark(job.job_id, JobStatus.FAILED)
+                    self.pool.mark_done(job.job_id, "failed")
                 except Exception as e:
                     print(f"[Track {self.track_id}] Error: {e}")
-                    self.pool.mark(job.job_id, JobStatus.FAILED)
+                    self.pool.mark_done(job.job_id, "failed")
 
             except Exception as e:
                 print(f"[Track {self.track_id}] Browser crash: {e} — restarting")

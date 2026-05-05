@@ -15,21 +15,17 @@ from core.settings_store import get_store
 CHECK_INTERVAL   = 10 * 60
 MAX_SWITCH_ATTEMPTS = 5
 
-PROTONVPN_PATHS = [
-    r"C:\Program Files\Proton\VPN\v3\ProtonVPN.exe",
-    r"C:\Program Files (x86)\Proton\VPN\ProtonVPN.exe",
-    r"C:\Program Files\ProtonVPN\ProtonVPN.exe",
-    "protonvpn-cli",
-    "protonvpn",
-]
+WINDSCRIBE_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe"
+
+PROTONVPN_PATHS = [WINDSCRIBE_CLI]  # kept for _find_vpn_cli compatibility
 
 MONITORED_SITES = [
     ("https://www.google.com/search?q=software+engineer+intern+greenhouse.io", "Google"),
     ("https://www.simplyhired.com/search?q=software+engineer+intern",          "SimplyHired"),
-    ("https://www.indeed.com/jobs?q=software+engineer+intern",                 "Indeed"),
 ]
 
-VPN_LOCATIONS = ["US-NY","US-CA","US-TX","US-IL","US-FL","US-WA","US-GA","US-OH","US-MA"]
+VPN_LOCATIONS = ["US Central", "US East", "US West", "US Texas", "US Florida",
+                 "US New York", "US California", "US Atlanta", "US Chicago"]
 
 BLOCK_SIGNATURES = [
     "captcha","unusual traffic","robot","rate limit",
@@ -39,17 +35,19 @@ BLOCK_SIGNATURES = [
 
 
 def _find_vpn_cli() -> tuple[str, str]:
-    for path in PROTONVPN_PATHS:
-        try:
-            check_path = Path(path)
-            if not check_path.exists() and path not in ("protonvpn-cli","protonvpn"):
-                continue
-            result = subprocess.run([path, "--version"], capture_output=True, timeout=5)
+    cli = WINDSCRIBE_CLI
+    try:
+        if Path(cli).exists():
+            result = subprocess.run([cli, "--version"], capture_output=True, timeout=5)
             out = (result.stdout + result.stderr).decode(errors="ignore").lower()
-            if result.returncode == 0 or "proton" in out or "version" in out:
-                return "protonvpn", path
-        except Exception:
-            continue
+            if result.returncode == 0 or "windscribe" in out or "version" in out:
+                return "windscribe", cli
+        # Also try if it's been added to PATH
+        result = subprocess.run(["windscribe-cli", "--version"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            return "windscribe", "windscribe-cli"
+    except Exception:
+        pass
     return "none", ""
 
 
@@ -71,22 +69,35 @@ def _is_blocked(content: str, status_code: int) -> bool:
 
 
 def _try_switch(cli_path: str, location: str = "") -> bool:
-    cmds = [
-        [cli_path, "connect", "--random"],
-        [cli_path, "c", "--random"],
-        [cli_path, "connect"],
-    ]
-    if location:
-        cmds.insert(0, [cli_path, "connect", location])
-    for cmd in cmds:
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=30)
-            out = (r.stdout + r.stderr).decode(errors="ignore").lower()
-            if r.returncode == 0 or "connected" in out or "success" in out:
-                return True
-        except Exception:
-            continue
-    return False
+    """Switch Windscribe server. Disconnect first, then reconnect to new location."""
+    try:
+        subprocess.run([cli_path, "disconnect"], capture_output=True, timeout=15)
+        time.sleep(2)
+        loc = location or "US East"
+        result = subprocess.run([cli_path, "connect", loc], capture_output=True, timeout=30)
+        out = (result.stdout + result.stderr).decode(errors="ignore").lower()
+        if "connected" in out or "success" in out:
+            return True
+        # Fallback: bare connect (picks best server)
+        result = subprocess.run([cli_path, "connect"], capture_output=True, timeout=30)
+        out = (result.stdout + result.stderr).decode(errors="ignore").lower()
+        return "connected" in out
+    except Exception as e:
+        print(f"[VPNController] Switch error: {e}")
+        return False
+
+
+def _get_windscribe_status(cli_path: str) -> str:
+    """Returns the connect state line from windscribe-cli status."""
+    try:
+        result = subprocess.run([cli_path, "status"], capture_output=True, timeout=10)
+        out = (result.stdout + result.stderr).decode(errors="ignore")
+        for line in out.splitlines():
+            if "connect state:" in line.lower():
+                return line.strip()
+    except Exception:
+        pass
+    return ""
 
 
 class VPNController:
@@ -111,14 +122,14 @@ class VPNController:
         print("║              VPN CONTROLLER — STARTUP                   ║")
         print("╠══════════════════════════════════════════════════════════╣")
         if self.auto_capable:
-            print(f"║  ✅ VPN CLI found: {self.vpn_type:<40}║")
-            print(f"║  ✅ Path: {self.cli_path:<48}║")
+            print(f"║  ✅ Windscribe CLI found at:                              ║")
+            print(f"║     {self.cli_path[:52]:<52}║")
             print(f"║  ✅ AUTO-SWITCHING: ENABLED                              ║")
             print(f"║     Will automatically rotate IP when RSS blocks hit     ║")
         else:
-            print(f"║  ⚠️  VPN CLI: NOT FOUND — auto-switching DISABLED         ║")
-            print(f"║  ⚠️  Run: winget install ProtonTechnologies.ProtonVPN     ║")
-            print(f"║     Until then: switch servers manually in ProtonVPN app  ║")
+            print(f"║  ⚠️  Windscribe CLI not found — auto-switching DISABLED   ║")
+            print(f"║  ⚠️  Login first: windscribe-cli.exe login               ║")
+            print(f"║     Path: C:\\Program Files\\Windscribe\\windscribe-cli.exe  ║")
         print(f"║  📍 Current IP: {self.current_ip:<42}║")
         print(f"║  🔍 Monitoring {len(MONITORED_SITES)} sites every {CHECK_INTERVAL//60} minutes              ║")
         print("╚══════════════════════════════════════════════════════════╝")
@@ -181,16 +192,17 @@ class VPNController:
         old_ip = self.current_ip
         for attempt in range(1, MAX_SWITCH_ATTEMPTS + 1):
             loc = random.choice(VPN_LOCATIONS)
-            print(f"[VPNController] 🔄 Switch attempt {attempt}/{MAX_SWITCH_ATTEMPTS}: {loc}...")
+            print(f"[VPNController] 🔄 Switch attempt {attempt}/{MAX_SWITCH_ATTEMPTS}: connecting to {loc}...")
             success = _try_switch(self.cli_path, loc)
             if success:
                 time.sleep(5)
                 new_ip = _get_current_ip()
+                status  = _get_windscribe_status(self.cli_path)
                 self.current_ip = new_ip
                 self.switch_count += 1
                 print(f"[VPNController] ✅ IP ROTATED SUCCESSFULLY!")
-                print(f"[VPNController] ✅ Old IP: {old_ip}")
-                print(f"[VPNController] ✅ New IP: {new_ip} (server: {loc})")
+                print(f"[VPNController] ✅ Old IP: {old_ip} → New IP: {new_ip}")
+                print(f"[VPNController] ✅ Server: {status}")
                 print(f"[VPNController] ✅ RSS blocks bypassed — resuming discovery")
                 self.status_cb("vpn", f"✅ IP rotated: {old_ip} → {new_ip}")
                 return
@@ -198,25 +210,19 @@ class VPNController:
             time.sleep(2)
 
         print(f"[VPNController] ✗ All {MAX_SWITCH_ATTEMPTS} switch attempts failed")
-        print(f"[VPNController] ⚠️  Please switch VPN server manually in ProtonVPN app")
+        print(f"[VPNController] ⚠️  Switch server manually in Windscribe app")
         self.status_cb("vpn", "⚠️ Auto-switch failed — switch manually")
 
     def _popup_alert(self, blocked_sites: str):
-        try:
-            from PyQt6.QtWidgets import QMessageBox, QApplication
-            if QApplication.instance():
-                msg = QMessageBox()
-                msg.setWindowTitle("⚠️ VPN — RSS Block Detected")
-                msg.setText(
-                    f"RSS/Cloudflare block detected!\n\n"
-                    f"Blocked: {blocked_sites}\n"
-                    f"Current IP: {self.current_ip}\n\n"
-                    f"Open ProtonVPN → switch to a different server."
-                )
-                msg.setIcon(QMessageBox.Icon.Warning)
-                msg.exec()
-        except Exception:
-            pass
+        """Non-blocking alert — terminal only to avoid Qt thread freeze."""
+        print()
+        print("=" * 60)
+        print(f"[VPNController] ⚠️  ACTION REQUIRED")
+        print(f"[VPNController] RSS block on: {blocked_sites}")
+        print(f"[VPNController] Open ProtonVPN app → switch to a different server")
+        print(f"[VPNController] No restart needed — new IP takes effect immediately")
+        print("=" * 60)
+        print()
 
 
 _controller: VPNController | None = None
