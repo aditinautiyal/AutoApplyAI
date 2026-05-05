@@ -20,7 +20,14 @@ from discovery.job_pool import get_pool
 
 # Optional imports — gracefully handle missing modules
 try:
-    from tracks.cover_letter_gen import generate_cover_letter
+    from tracks.cover_letter_gen import generate_cover_letter as _gcl_real
+    async def generate_cover_letter(job, insight, **kwargs):
+        return _gcl_real(
+            job_title=job.title,
+            company=job.company,
+            job_description=getattr(job, 'description', '') or '',
+            insight=insight,
+        )
 except ImportError:
     async def generate_cover_letter(job, insight, **kwargs):
         return f"I am excited to apply for {job.title} at {job.company}."
@@ -259,17 +266,17 @@ class TrackWorker:
 
                     if success:
                         print(f"[Track {self.track_id}] ✅ CONFIRMED SUBMISSION: {job.title} @ {job.company}")
-                        self.pool.mark(job.job_id, "submitted")
+                        self.pool.mark_done(job.job_id, "submitted")
                     else:
                         print(f"[Track {self.track_id}] ✗ Failed: {job.title} @ {job.company}")
-                        self.pool.mark(job.job_id, "failed")
+                        self.pool.mark_done(job.job_id, "failed")
 
                 except asyncio.TimeoutError:
                     print(f"[Track {self.track_id}] Timeout — {job.company}")
-                    self.pool.mark(job.job_id, "failed")
+                    self.pool.mark_done(job.job_id, "failed")
                 except Exception as e:
                     print(f"[Track {self.track_id}] Error: {e}")
-                    self.pool.mark(job.job_id, "failed")
+                    self.pool.mark_done(job.job_id, "failed")
 
             except Exception as e:
                 print(f"[Track {self.track_id}] Browser crash: {e} — restarting")
