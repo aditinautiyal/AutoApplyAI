@@ -62,6 +62,13 @@ try:
 except ImportError:
     _has_approval = False
 
+# VPN coordination — tracks pause while VPN is switching servers
+try:
+    from discovery.vpn_controller import VPN_SWITCHING
+except ImportError:
+    import threading
+    VPN_SWITCHING = threading.Event()  # fallback: never blocks
+
 # ── Profile defaults ──────────────────────────────────────────────────────────
 
 PROFILE_PATH_BASE = Path.home() / ".autoapplyai"
@@ -278,17 +285,36 @@ class TrackWorker:
     async def _launch_browser(self):
         profile_dir = PROFILE_PATH_BASE / f"track_{self.track_id}"
         profile_dir.mkdir(parents=True, exist_ok=True)
-        pw = await async_playwright().start()
-        self._context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-            ignore_default_args=["--enable-automation"],
-        )
-        self.page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-        await self.page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+
+        for attempt in range(3):
+            try:
+                pw = await async_playwright().start()
+                self._context = await pw.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=False,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                    ignore_default_args=["--enable-automation"],
+                )
+                self.page = (
+                    self._context.pages[0]
+                    if self._context.pages
+                    else await self._context.new_page()
+                )
+                await self.page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                self._log(f"Browser launched (attempt {attempt + 1})")
+                return
+            except Exception as e:
+                self._log(f"Browser launch attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(3)
+
+        raise RuntimeError("Could not launch browser after 3 attempts")
 
     async def _close_browser(self):
         try:
@@ -300,33 +326,97 @@ class TrackWorker:
     # ── Main Loop ─────────────────────────────────────────────────────────────
 
     async def run(self):
+        consecutive_failures = 0
         while not self._should_stop():
             try:
-                if not self.page or self.page.is_closed():
-                    await self._close_browser()
-                    await self._launch_browser()
+                # ── VPN coordination: wait if VPN is switching servers ──
+                # This prevents EPIPE crashes from mid-session IP rotation
+                if VPN_SWITCHING.is_set():
+                    self._log("⏸ VPN switching — pausing until IP rotation completes...")
+                    await self._close_browser()  # Close browser before network changes
+                    # Wait for VPN switch to complete (polls every 2 seconds)
+                    while VPN_SWITCHING.is_set() and not self._should_stop():
+                        await asyncio.sleep(2)
+                    self._log("▶ VPN switch complete — resuming")
+                    await asyncio.sleep(3)  # Brief stabilization delay
+                    consecutive_failures = 0
 
+                # ── Ensure browser is healthy ──
+                browser_ok = False
+                for _ in range(3):
+                    try:
+                        if not self.page or self.page.is_closed():
+                            await self._close_browser()
+                            await self._launch_browser()
+                        # Quick health check
+                        await self.page.evaluate("() => document.readyState")
+                        browser_ok = True
+                        break
+                    except Exception as e:
+                        self._log(f"Browser not healthy: {e} — restarting")
+                        await self._close_browser()
+                        await asyncio.sleep(2)
+                        consecutive_failures += 1
+
+                if not browser_ok:
+                    self._log("Browser restart failed 3x — waiting 30s")
+                    await asyncio.sleep(30)
+                    consecutive_failures = 0
+                    continue
+
+                # ── Get next job ──
                 job = self.pool.get_next()
                 if not job:
                     await asyncio.sleep(5)
                     continue
 
+                # ── Check VPN again right before applying ──
+                if VPN_SWITCHING.is_set():
+                    self._log("⏸ VPN switching mid-loop — pausing")
+                    await self._close_browser()
+                    while VPN_SWITCHING.is_set() and not self._should_stop():
+                        await asyncio.sleep(2)
+                    self._log("▶ VPN switch done — continuing")
+                    await asyncio.sleep(3)
+                    # Put job back
+                    self.pool.requeue(job) if hasattr(self.pool, 'requeue') else None
+                    continue
+
                 self._notify(f"Applying: {job.title} @ {job.company}")
                 self._log(f"► {job.title} @ {job.company}")
+                consecutive_failures = 0
 
                 try:
                     await self._process_job(job)
                 except asyncio.TimeoutError:
                     self._log(f"Timeout — {job.company}")
                     self.pool.mark_done(job.job_id, "failed")
+                except (ConnectionError, BrokenPipeError, OSError) as e:
+                    # Network/EPIPE error — browser connection died (usually from VPN switch)
+                    self._log(f"Network error (VPN switch?): {e} — will retry job")
+                    self.pool.mark_done(job.job_id, "failed")
+                    await self._close_browser()
+                    await asyncio.sleep(5)
                 except Exception as e:
                     self._log(f"Error: {e}")
                     self.pool.mark_done(job.job_id, "failed")
 
+            except (ConnectionError, BrokenPipeError, OSError) as e:
+                self._log(f"Network/pipe error: {e} — restarting browser")
+                await self._close_browser()
+                await asyncio.sleep(5)
+                consecutive_failures += 1
             except Exception as e:
                 self._log(f"Browser crash: {e} — restarting")
                 await self._close_browser()
                 await asyncio.sleep(3)
+                consecutive_failures += 1
+
+            # Safety: if too many consecutive failures, wait longer
+            if consecutive_failures >= 5:
+                self._log(f"⚠ {consecutive_failures} consecutive failures — waiting 60s")
+                await asyncio.sleep(60)
+                consecutive_failures = 0
 
     async def _process_job(self, job):
         # Research
@@ -423,6 +513,9 @@ class TrackWorker:
         except PwTimeout:
             self._log("Page timeout")
             return False
+        except (ConnectionError, BrokenPipeError, OSError) as e:
+            # Re-raise network errors so run() can handle them properly
+            raise
         except Exception as e:
             self._log(f"Apply error: {e}")
             return False
