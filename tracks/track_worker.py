@@ -634,6 +634,17 @@ class TrackWorker:
                 self._log(f"⚠ No native match for '{target}' in '{hint}'")
                 return False
 
+            # Reject phone prefix options (e.g. "United States +1")
+            if "+" in best["text"] and "country" in hint.lower():
+                # Find the option without "+" 
+                for opt, s in scored:
+                    if "+" not in opt["text"] and s >= 0.25:
+                        best = opt
+                        break
+                else:
+                    self._log(f"⚠ Only phone prefix options found for '{hint}' — skipping")
+                    return False
+
             await el.select_option(index=best["idx"])
             await self._delay(0.3, 0.5)
             # Fire change event so React sees it
@@ -653,6 +664,12 @@ class TrackWorker:
         Handle React-Select / custom div dropdowns.
         Strategy: click to open → type to filter → pick from document-wide options.
         """
+        # SAFETY: Never type long text or multiline text into a dropdown search box.
+        # Dropdowns only accept short values like "Yes", "No", "United States".
+        if len(target) > 80 or "\n" in target:
+            return False
+
+
         try:
             await trigger_el.click(timeout=3000)
             await self._delay(0.4, 0.7)
@@ -1042,6 +1059,11 @@ class TrackWorker:
             state     = addr.split(",")[1].strip() if "," in addr else "Indiana"
 
             # ── STEP 1: Country (MUST be first — re-renders the form) ──────
+            # IMPORTANT: Greenhouse has TWO dropdowns with "United States":
+            # 1. The real country select (we want this)
+            # 2. The phone country code "+1" select (we must avoid this)
+            # Solution: always target select#country or select[name*="country"] specifically.
+            # If selected value contains "+" it was the phone prefix — skip it.
             self._log("Setting country...")
             country_done = False
 
@@ -1070,14 +1092,18 @@ class TrackWorker:
                             break
 
             if not country_done:
-                # JS nuclear option: find any select with 'country' anywhere in attributes
+                # JS nuclear option — explicitly exclude phone prefix dropdowns
                 result = await self.page.evaluate("""() => {
                     const selects = Array.from(document.querySelectorAll('select'));
                     for (const sel of selects) {
                         const attrs = (sel.name + sel.id + sel.className).toLowerCase();
                         if (!attrs.includes('country')) continue;
+                        // Skip phone prefix selects (options contain "+1", "+44" etc.)
+                        const hasPhonePrefix = Array.from(sel.options)
+                            .some(o => o.text.includes('+') && o.text.includes('United States'));
+                        if (hasPhonePrefix) continue;
                         const us = Array.from(sel.options).find(o =>
-                            o.text.includes('United States') ||
+                            o.text === 'United States' ||
                             o.value === 'US' || o.value === 'USA' || o.value === 'united_states'
                         );
                         if (us) {
@@ -1414,9 +1440,25 @@ class TrackWorker:
         try:
             self._log(f"Filling generic form: {self.page.url[:60]}")
 
-            # Stripe: find embedded ATS link or apply button
+            # Stripe: navigate to /apply version of the listing URL
             if "stripe.com/jobs" in self.page.url:
                 try:
+                    current = self.page.url
+                    # If we're on a listing page, try /apply suffix first
+                    if "/apply" not in current:
+                        apply_url = current.rstrip("/") + "/apply"
+                        self._log(f"Stripe: navigating to {apply_url[:60]}")
+                        await self.page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
+                        await self._delay(1.5, 2)
+                        await self._dismiss_popups()
+                        # Check if we landed on an ATS form
+                        if _detect_ats(self.page.url) == "greenhouse":
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+                        # Check for embedded Greenhouse form
+                        if "greenhouse" in self.page.url or "grnh" in self.page.url:
+                            return await self._fill_greenhouse(job, insight, cover_letter, profile)
+
+                    # Scan for embedded ATS links
                     links = await self.page.evaluate("""() =>
                         Array.from(document.querySelectorAll('a[href]'))
                             .map(a => a.href)
@@ -1431,10 +1473,8 @@ class TrackWorker:
                         await self._dismiss_popups()
                         return await self._dispatch_to_filler(job, insight, cover_letter, profile)
 
-                    # Look for Apply button that navigates to form
-                    for btn_sel in [
-                        "a[href*='/apply']", "a:has-text('Apply')", "button:has-text('Apply')"
-                    ]:
+                    # Look for Apply button
+                    for btn_sel in ["a[href*='/apply']", "a:has-text('Apply')", "button:has-text('Apply')"]:
                         btn = await self.page.query_selector(btn_sel)
                         if btn and await btn.is_visible():
                             href = await btn.get_attribute("href") or ""
@@ -1649,11 +1689,32 @@ class TrackWorker:
             "worked at": "No",
             "relocate": "Yes", "willing to relocate": "Yes",
             # EEOC / demographic
-            "gender": "Prefer not to say",
+            "gender": "Female",
             "race": "Prefer not to say", "ethnicity": "Prefer not to say",
             "veteran": "No", "disability": "No",
             "hispanic or latino": "No",
+            "hispanic": "No",
             "sexual orientation": "Prefer not to say",
+            "decline to self identify": "Prefer not to say",
+
+            # Graduation yes/no questions (e.g. "Is grad date between Jan-Jul 2026?")
+            "is your expected graduation date between": "Yes",
+            "graduation date between": "Yes",
+            "graduating between": "Yes",
+            "expected graduation date between": "Yes",
+            "graduation between": "Yes",
+
+            # Text consent
+            "consent to receive text": "No",
+            "text updates from your recruiter": "No",
+            "text message": "No",
+            "sms": "No",
+
+            # Office location
+            "preferred office location": "Remote",
+            "office location": "Remote",
+            "preferred location": "Remote",
+            "work location": "Remote",
             # Consent
             "brighthire": "Yes, I consent",
             "consent": "Yes", "background check": "Yes", "agree": "Yes",
@@ -1803,10 +1864,48 @@ class TrackWorker:
                     continue
                 val = self._match(label, fm)
                 if val:
-                    if await self._select_native(sel_el, val, label):
-                        filled += 1
-                    elif await self._select_keyboard(sel_el, val, label):
-                        filled += 1
+                    # For EEOC fields: try "Decline To Self Identify" aliases
+                    eeoc_labels = ["gender", "race", "ethnicity", "hispanic", "veteran",
+                                   "disability", "sexual orientation"]
+                    is_eeoc = any(k in label for k in eeoc_labels)
+
+                    if is_eeoc:
+                        # Try "Decline To Self Identify" first, then the val
+                        decline_aliases = [
+                            "Decline To Self Identify", "Decline to Self Identify",
+                            "I don't wish to answer", "Prefer not to say",
+                            "Prefer Not to Say", "Prefer not to disclose",
+                            "I prefer not to answer", "Choose not to disclose",
+                            "I do not wish to provide", "Not Specified",
+                        ]
+                        # For gender specifically, try Female first
+                        if "gender" in label:
+                            gender_opts = ["Female", "Woman", "F"]
+                            for gv in gender_opts:
+                                ok = await self._select_native(sel_el, gv, label)
+                                if ok:
+                                    filled += 1
+                                    break
+                            else:
+                                for da in decline_aliases:
+                                    ok = await self._select_native(sel_el, da, label)
+                                    if ok:
+                                        filled += 1
+                                        break
+                        else:
+                            # For race/hispanic/etc: try "No" or "Decline" style
+                            no_opts = ["No", "Not Hispanic or Latino",
+                                       "I am not Hispanic or Latino"] + decline_aliases
+                            for no_v in no_opts:
+                                ok = await self._select_native(sel_el, no_v, label)
+                                if ok:
+                                    filled += 1
+                                    break
+                    else:
+                        if await self._select_native(sel_el, val, label):
+                            filled += 1
+                        elif await self._select_keyboard(sel_el, val, label):
+                            filled += 1
                 else:
                     # Unknown: pick first non-placeholder option
                     opts = await sel_el.evaluate(
@@ -1854,12 +1953,36 @@ class TrackWorker:
                 if not label or len(label) < 2:
                     continue
                 val = self._match(label.lower().strip(), fm)
-                if val:
-                    ok = await self._select_custom(ctrl, val, label)
-                    if not ok:
-                        ok = await self._select_keyboard(ctrl, val, label)
-                    if ok:
-                        filled += 1
+                if val and len(val) <= 80 and "\n" not in val:
+                    eeoc_labels = ["gender", "race", "ethnicity", "hispanic",
+                                   "veteran", "disability"]
+                    is_eeoc = any(k in label.lower() for k in eeoc_labels)
+
+                    if is_eeoc and "gender" in label.lower():
+                        # Try Female first for gender
+                        ok = await self._select_custom(ctrl, "Female", label)
+                        if not ok:
+                            ok = await self._select_keyboard(ctrl, "Female", label)
+                        if not ok:
+                            ok = await self._select_custom(ctrl, "Decline To Self Identify", label)
+                        if ok:
+                            filled += 1
+                    elif is_eeoc:
+                        # Try No / Decline for race/hispanic/etc
+                        for try_val in ["No", "Not Hispanic or Latino",
+                                        "Decline To Self Identify", val]:
+                            ok = await self._select_custom(ctrl, try_val, label)
+                            if not ok:
+                                ok = await self._select_keyboard(ctrl, try_val, label)
+                            if ok:
+                                filled += 1
+                                break
+                    else:
+                        ok = await self._select_custom(ctrl, val, label)
+                        if not ok:
+                            ok = await self._select_keyboard(ctrl, val, label)
+                        if ok:
+                            filled += 1
                 await self._delay(0.3, 0.5)
             except Exception:
                 continue
